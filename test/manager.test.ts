@@ -21,6 +21,7 @@ function fixture() {
   let running = false
   let failNext = false
   let failLaunch = false
+  let failNavigationFor: string | undefined
   let blocked: Promise<void> | undefined
   let releaseBlock: (() => void) | undefined
   let enteredBlock: (() => void) | undefined
@@ -58,7 +59,14 @@ function fixture() {
         if (!found) throw new Error("Unknown upstream page")
         const [tabId, tab] = found
         if (name === "get_tab_id") return structured({ tabId })
-        if (name === "navigate_page") { tab.url = args.url as string; return structured({ pages: [...tabs.values()] }) }
+        if (name === "navigate_page") {
+          if (failNavigationFor !== undefined && args.url === failNavigationFor) {
+            failNavigationFor = undefined
+            return { ...structured({ errorMessage: "restoration navigation failed" }), isError: true }
+          }
+          tab.url = args.url as string
+          return structured({ pages: [...tabs.values()] })
+        }
         if (blocked && name === "evaluate_script") {
           enteredBlock?.()
           await blocked
@@ -78,6 +86,7 @@ function fixture() {
     advance(ms: number) { now += ms },
     fail() { failNext = true },
     failLaunch() { failLaunch = true },
+    failNavigation(url: string) { failNavigationFor = url },
     crash() { running = false },
     block() {
       blocked = new Promise<void>((resolve) => { releaseBlock = resolve })
@@ -263,6 +272,52 @@ test("failed mode changes pause automation and can be retried without losing own
   assert.equal(parse(await f.manager.execute("list_pages", {}, caller("b"))).pages[0].pageId, b)
   await f.manager.dispose()
 })
+
+test("restoration navigation errors keep mode changes paused and preserve every session's tabs for retry", async () => {
+  const f = fixture()
+  try {
+    const a = await f.open("a")
+    const b = await f.open("b")
+    // Fail after the first session's tab has already been restored.
+    f.failNavigation("https://b.test/")
+    await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /restoration navigation failed/)
+    assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).paused, true)
+    await assert.rejects(f.manager.execute("take_snapshot", { pageId: a }, caller("a")), /mode transition failed/)
+    await assert.rejects(f.manager.execute("take_snapshot", { pageId: b }, caller("b")), /mode transition failed/)
+
+    const retry = parse(await f.manager.execute("switch_mode", { mode: "headed" }, caller("a")))
+    assert.equal(retry.changed, true)
+    assert.equal(retry.paused, false)
+    for (const [sessionID, pageId] of [["a", a], ["b", b]]) {
+      const pages = parse(await f.manager.execute("list_pages", {}, caller(sessionID))).pages
+      assert.deepEqual(pages.map((page: any) => ({ pageId: page.pageId, url: page.url })), [{ pageId, url: `https://${sessionID}.test/` }])
+    }
+  } finally { await f.manager.dispose() }
+})
+
+for (const phase of ["login_start", "login_finish"] as const) {
+  test(`${phase} navigation errors preserve the login pause and saved tabs until recovery succeeds`, async () => {
+    const f = fixture()
+    try {
+      const a = await f.open("a")
+      const b = await f.open("b")
+      if (phase === "login_finish") await f.manager.execute("login_start", { pageId: a }, caller("a"))
+      f.failNavigation("https://b.test/")
+      await assert.rejects(f.manager.execute(phase, phase === "login_start" ? { pageId: a } : {}, caller("a")), /restoration navigation failed/)
+      const status = parse(await f.manager.execute("status", {}, caller("a")))
+      assert.equal(status.paused, true)
+      assert.equal(status.loginOwnedByThisSession, true)
+      await assert.rejects(f.manager.execute("take_snapshot", { pageId: b }, caller("b")), /paused for human login/)
+
+      await f.manager.execute("login_finish", {}, caller("a"))
+      assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).paused, false)
+      for (const [sessionID, pageId] of [["a", a], ["b", b]]) {
+        const pages = parse(await f.manager.execute("list_pages", {}, caller(sessionID))).pages
+        assert.deepEqual(pages.map((page: any) => ({ pageId: page.pageId, url: page.url })), [{ pageId, url: `https://${sessionID}.test/` }])
+      }
+    } finally { await f.manager.dispose() }
+  })
+}
 
 test("releasing a session during a failed mode change never resurrects its tabs on retry", async () => {
   const f = fixture()

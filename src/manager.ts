@@ -246,7 +246,7 @@ export class BrowserManager {
       const page = await this.createPage(saved.sessionID, saved.pageId)
       // Do not replay javascript/data/file URLs or form submissions during login.
       if (/^https?:\/\//i.test(saved.url)) {
-        await this.call("navigate_page", { pageId: page.upstreamId, url: saved.url })
+        data(await this.call("navigate_page", { pageId: page.upstreamId, url: saved.url }))
       }
     }
     await this.refresh()
