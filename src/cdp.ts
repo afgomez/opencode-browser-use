@@ -21,16 +21,16 @@ export class Cdp {
     socket.addEventListener("error", () => { if (client.socket === socket) client.rejectPending() })
   }
 
-  static async connect(url: string): Promise<Cdp> {
+  static async connect(url: string, timeout = 10_000): Promise<Cdp> {
     const socket = new WebSocket(url)
     const client = new Cdp(socket)
-    await Cdp.ready(socket)
+    await Cdp.ready(socket, timeout)
     return client
   }
 
-  private static async ready(socket: WebSocket) {
+  private static async ready(socket: WebSocket, timeout = 10_000) {
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { socket.close(); reject(new Error("Chrome CDP connection timed out")) }, 10_000)
+      const timer = setTimeout(() => { socket.close(); reject(new Error("Chrome CDP connection timed out")) }, timeout)
       socket.addEventListener("open", () => { clearTimeout(timer); resolve() }, { once: true })
       socket.addEventListener("error", () => { clearTimeout(timer); reject(new Error("Chrome CDP connection failed")) }, { once: true })
     })

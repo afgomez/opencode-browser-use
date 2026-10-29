@@ -24,7 +24,7 @@ export async function connectMcp(nodePath: string, browserUrl: string): Promise<
   }))
   const transport = new StdioClientTransport({
     command: nodePath,
-    args: [executable, `--browser-url=${browserUrl}`, "--page-id-routing",
+    args: [executable, `${browserUrl.startsWith("ws:") ? "--ws-endpoint" : "--browser-url"}=${browserUrl}`, "--page-id-routing",
       "--experimental-structured-content", "--experimental-interop-tools",
       "--redact-network-headers", "--no-usage-statistics", "--no-performance-crux",
       "--no-category-performance", "--no-category-memory"],

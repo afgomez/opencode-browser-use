@@ -1,8 +1,9 @@
 # OpenCode browser-use
 
-Local OpenCode V2 server plugin. Owns a private, pinned `chrome-devtools-mcp`
-subprocess and a dedicated regular Google Chrome instance. No Pi dependency,
-standalone daemon, global MCP installation, or browser download.
+Local OpenCode V2 server plugin using a private, pinned `chrome-devtools-mcp`
+subprocess. Each session can use shared plugin Chrome, isolated plugin Chrome,
+or attach to the user's running Chrome. No Pi dependency, standalone daemon,
+global MCP installation, extension, or browser download.
 
 ## Setup
 
@@ -25,7 +26,51 @@ in `~/.config/opencode/opencode.jsonc`:
 
 Keep other existing plugin entries when adding this registration. Do not configure
 a separate `browser` MCP server: the upstream connection is private.
-Chrome starts only on the first browser operation, not during plugin setup.
+Plugin-owned Chrome starts only on the first browser operation, not during plugin
+setup. Attach mode never starts Chrome.
+
+## Browser modes
+
+Each new OpenCode session defaults to **Shared**. The user's selection persists
+per session across service restarts; changing one session does not change the
+default for new sessions. Only trusted user controls can switch modes, never
+model tools. Switch with the sidebar settings dialog or:
+
+```text
+/browser-use
+/browser-use mode
+/browser-use mode shared
+/browser-use mode isolated
+/browser-use mode attach
+```
+
+`/browser-use` without arguments opens the same settings dialog as the sidebar.
+
+Every actual change requires confirmation and closes the switching session's
+owned tabs. Their handles and unsaved state are not restored. Other sessions'
+tabs are unaffected. Switching during login or recovery is blocked.
+
+- **Shared** uses the existing plugin-owned Chrome and persistent profile.
+  Sessions share cookies and storage; tab ownership remains per session.
+- **Isolated** gives each session a separate Chrome, MCP connection and
+  persistent profile. Profiles survive inactivity and service restart, but are
+  removed on session deletion, including after switching away. Idle browsers
+  may stop without deleting their profiles. Deletion waits for a stale profile
+  lock and stops a verified surviving plugin Chrome before removing its files;
+  if this cannot be done safely, cleanup fails and is logged rather than deleting
+  a profile in use.
+- **Attach** attaches to running Chrome 144+ using its standard stable-channel
+  user-data directory. Enable remote debugging at
+  `chrome://inspect/#remote-debugging` and approve connection requests. The
+  plugin does not launch Chrome, install an extension, or explicitly terminate
+  the user's Chrome. It closes only tabs it created; closing the last tab may
+  naturally cause Chrome to exit. Existing user and popup tabs are never adopted.
+  This mode shares the user's cookies and other profile state. If attachment or
+  consent is unavailable it fails, with no fallback to another browser.
+
+Chrome may request approval separately for the plugin's metadata and MCP
+connections. Attach-mode attachment requires a manual check in the user's actual
+Chrome; it is not covered by the disposable-profile integration tests.
 
 ## Tools
 
@@ -60,29 +105,25 @@ human can still use popups during the login handoff.
 
 ## Sidebar
 
-The terminal UI adds a **Browser use** section to the session sidebar while that
-session owns open tabs. Each entry shows its title and a muted URL, truncated to
-the available width. Pages without a title show **Untitled**. The section hides
-when there are no tabs and follows the viewed session, not the entire browser
-or its parent/subagent sessions.
+The terminal UI always shows a **Browser use** title and **Settings** button in
+the session sidebar, including before Chrome starts and when there are no tabs.
+Each tab entry shows its title and a muted URL, truncated to the available width.
+Pages without a title show **Untitled**. The list follows the viewed session,
+not the entire browser or its parent/subagent sessions.
 
-On the title row, a **Headless** (or **Headed**) button shows the shared browser
-visibility with a dropdown arrow (**Headless ▾**). It has horizontal padding, the theme's primary-action
-filled/focused background and matching text color (the normal action background
-can be transparent), a bold label, and themed hover/disabled
-states. It stays on the same line
-in narrow sidebars by truncating the title if needed. Tab entries remain indented.
-Clicking the button opens OpenCode's native selection dialog
-with **Headless** and **Headed**, initially selecting the current visibility. Cancelling
-or choosing the current visibility does nothing. Choosing a different value opens a
-confirmation warning that every session's tabs
-will reload and unsaved page state/snapshots will be lost. That
-confirmation is the user's authorization: sidebar actions do not evaluate agent
-permission rules, including `ask` or `deny`. Agent browser tools still enforce
-those rules unchanged. Choosing the current visibility is a no-op. Controls show
-only an animated spinner in place of the visibility button while applying a confirmed change, not while the
-picker or confirmation is open, and are disabled during a login/recovery pause. Failed
-switches show an error toast rather than optimistically changing the highlight.
+The title-row **Settings** button opens a custom dialog showing mode and visibility
+choices together. Use the mouse or arrow keys/Tab and Enter to choose. The
+current mode and visibility appear beneath the title (for example, **Shared / Headless**); visibility
+is hidden in Attach mode. Mode changes require confirmation and close this
+session's owned tabs. Visibility changes require confirmation and reload the
+affected browser's owned tabs: all Shared sessions, or only the Isolated
+session. Unsaved page state and snapshots are lost. Controls show a spinner
+while applying a confirmed change and are disabled during login/recovery or
+when the browser state cannot be read. Changing mode or visibility while the
+browser is stopped configures future use; it never launches or attaches to Chrome.
+Failed switches show an error toast. The confirmation authorizes these trusted
+client controls, which do not evaluate agent permission rules; agent tools still
+enforce those rules unchanged.
 
 The list and visibility refresh about once per second while mounted, including human title,
 navigation, and close changes during headed inspection or login. Reads share
@@ -94,19 +135,20 @@ unmounting cancels the old reader and discards late responses.
 Tab entries remain read-only: no links, focus switches, or close controls. Inspection never
 starts/restarts Chrome, renews a session lease, or adopts unknown tabs. It reads
 only target metadata over the private connection; login remains paused. If the
-metadata socket disconnects while Chrome is still owned and alive, inspection
+metadata socket disconnects while plugin-owned Chrome is still alive, inspection
 reattaches to the exact same endpoint and retries that read once, without
 reloading tabs or replaying browser actions.
 The TUI part loads automatically with the existing plugin registration, with no
 additional permission rules. Other clients can import the `./rpc` contract and
-call `pages({ sessionID })` at the session's location; it returns the shared
-`visibility` and `paused` state alongside only that session's owned `pageId`, `title`,
+call `pages({ sessionID })` at the session's location; it returns `mode`,
+`visibility` (null in Attach mode), and `paused` alongside only that session's owned `pageId`, `title`,
 and `url` fields. `setVisibility({ sessionID, visibility })` is a trusted-client control:
 it bypasses agent permission rules and relies on the UI's confirmation, while
 using the same serialized lifecycle and login-pause restrictions as the browser
 tools. The RPC itself does not prove a human confirmed; it is not an agent tool
 or a security boundary against untrusted clients. Session IDs for this UI API come from the
-client, never from model-supplied browser-tool inputs.
+client, never from model-supplied browser-tool inputs. `setMode` is likewise a
+trusted-client control and must only be invoked after user confirmation.
 
 The browser state uses `visibility` consistently in RPC responses and `status`.
 Hot reload migrates the legacy in-memory field without restarting Chrome or
@@ -130,19 +172,21 @@ confirmation as the sidebar, bypass agent permission rules, and share its busy
 state/spinner. Choosing the current visibility is a no-op.
 
 Changing visibility does not pause automation: you can watch the
-agent work in a visible window. The change applies to the one shared Chrome process,
-so every session's owned tabs are reloaded. HTTP(S) URLs, persistent cookies, and
+agent work in a visible window. In Shared mode every shared session's tabs are
+reloaded; in Isolated mode only that session's tabs are reloaded. Attach mode has
+no visibility control. HTTP(S) URLs, persistent cookies, and
 page handles survive; unsaved page state, navigation history, and snapshot UIDs
 do not. Always take fresh snapshots afterward. The calling session's first owned
 tab is activated when switching to headed visibility; other sessions' tabs are never
 selected for it.
 
 Requesting the already-selected visibility is a no-op and does not restart Chrome.
-Requesting headless before Chrome has started does not start it. Switching to
-headed can start Chrome without first launching it headless. `status` reports
-`visibility` (`headed` or `headless`) separately from `paused`.
+Changing visibility while Chrome is stopped only sets the next launch's
+visibility, without starting Chrome or creating a session lease. The selection
+survives sidebar polling and idle cleanup until Chrome is used. `status` reports
+`mode` and `visibility` (`headed` or `headless`, null for Attach) separately from `paused`.
 
-Visibility changes drain the shared operation queue before restarting. A failed
+Visibility changes drain the affected browser's operation queue before restarting. A failed
 restart pauses automation rather than exposing partly restored state; retry an
 explicit `/browser-use visibility headless` or `headed` command to recover,
 even if the requested visibility is already selected. A visibility change cannot bypass an active human-login
@@ -154,12 +198,16 @@ Idle shutdown resets the default to headless for the next browser launch.
 
 Get user approval before starting. Then:
 
-1. `login_start({pageId})` drains pending calls, pauses **all sessions**, and
-   restarts the shared profile in visible Chrome. The requested tab is activated.
+1. `login_start({pageId})` drains pending calls, pauses the affected browser,
+   and restarts its profile in visible Chrome. Shared mode pauses all shared
+   sessions; Isolated mode pauses only its session. The requested tab is activated.
 2. The human completes authentication in Chrome. Do not send passwords through
    chat or browser tools. Wait for the human to confirm completion.
 3. `login_finish({})`, from the initiating session, restarts Chrome headless and
-   resumes other sessions. Authentication cookies/storage persist.
+   resumes the affected sessions. Authentication cookies/storage persist.
+
+In Attach mode these calls do not restart or pause Chrome. Ask the user to log in
+manually in their own Chrome and wait for confirmation before continuing.
 
 **Restarts reload every owned HTTP(S) URL. They lose unsaved form state,
 in-memory JavaScript, sessionStorage, navigation history, and old snapshot
@@ -188,7 +236,7 @@ the broad `*` rule because the last matching rule wins.
   `globalThis` registry across per-location instances and module reloads.
   Compatible additive reloads update its implementation without discarding live
   leases, page handles, or the shared serialization queue.
-- One private MCP connection, with all browser and lifecycle calls serialized.
+- One private MCP connection per active browser, with browser and lifecycle calls serialized.
   This favors correctness over parallel browser throughput in this first version.
 - Stable Chrome tab target identities are checked and mapped to private MCP
   page IDs. MCP reconnection never trusts old numeric indexes or retries actions.
@@ -196,7 +244,8 @@ the broad `*` rule because the last matching rule wins.
 - Each session holds a renewable lease. Every browser operation renews it.
   Explicit release, session deletion, or 30 minutes without browser-tool activity
   closes that session's tabs. Long pauses may therefore require opening new tabs.
-- With no leases, Chrome exits after a one-minute idle grace period.
+- With no leases, plugin-owned Chrome exits after a one-minute idle grace period.
+  User Chrome is disconnected, never explicitly closed.
 - Plugin unload has a 30-second grace period so reloads do not immediately
   discard active tabs. Other loaded locations retain the shared manager.
   Once fully unloaded and stopped, the manager is removed from the registry so
@@ -257,8 +306,10 @@ requests are disabled. This does not disable Chrome's own network services.
 ## Boundaries
 
 Tab ownership prevents accidental cross-session interference; it is **not a
-security sandbox**. Sessions share profile cookies, localStorage, accounts, and
-browser process authority. Page JavaScript can use the authenticated profile;
+security sandbox**. Shared-mode sessions share profile cookies, localStorage,
+accounts, and browser process authority; Attach mode shares the user's profile.
+Isolated profiles separate browser state but are not an OS security sandbox.
+Page JavaScript can use the authenticated profile;
 same-origin windows may interact. Unrestricted shell access can bypass a local
 debugging endpoint. Never use this profile for mutually untrusted agents.
 

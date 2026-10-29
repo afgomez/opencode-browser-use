@@ -7,6 +7,7 @@ import { filteredResult, pageTools, permissionFor, wrappedCatalog } from "../src
 import type { Mcp } from "../src/mcp"
 import type { BrowserProcess } from "../src/chrome"
 import { emptySnapshot } from "../src/rpc"
+import { Cdp } from "../src/cdp"
 
 const config = () => options({ profileDirectory: "/test/browser", idleTimeoutMs: 100, leaseTimeoutMs: 1000, loginTimeoutMs: 500, unloadGraceMs: 200 })
 const caller = (sessionID: string, signal?: AbortSignal) => ({ sessionID, directory: "/workspace", signal })
@@ -24,6 +25,8 @@ function fixture() {
   let failLaunch = false
   let failNavigationFor: string | undefined
   let failCdp = false
+  let failIdentification = false
+  let current = true
   let blocked: Promise<void> | undefined
   let releaseBlock: (() => void) | undefined
   let enteredBlock: (() => void) | undefined
@@ -39,6 +42,7 @@ function fixture() {
     return { success: true }
   } }
   const chrome = {
+    async current() { return current },
     async start(headless: boolean) {
       if (failLaunch) { failLaunch = false; throw new Error("launch failed") }
       running = true
@@ -64,7 +68,10 @@ function fixture() {
         const found = [...tabs].find(([, tab]) => tab.id === args.pageId)
         if (!found) throw new Error("Unknown upstream page")
         const [tabId, tab] = found
-        if (name === "get_tab_id") return structured({ tabId })
+        if (name === "get_tab_id") {
+          if (failIdentification) { failIdentification = false; throw new Error("identification failed") }
+          return structured({ tabId })
+        }
         if (name === "navigate_page") {
           if (failNavigationFor !== undefined && args.url === failNavigationFor) {
             failNavigationFor = undefined
@@ -94,7 +101,9 @@ function fixture() {
     failLaunch() { failLaunch = true },
     failNavigation(url: string) { failNavigationFor = url },
     failCdp() { failCdp = true },
+    failIdentification() { failIdentification = true },
     crash() { running = false },
+    replace() { current = false },
     block() {
       blocked = new Promise<void>((resolve) => { releaseBlock = resolve })
       return new Promise<void>((resolve) => { enteredBlock = resolve })
@@ -102,6 +111,67 @@ function fixture() {
     unblock() { releaseBlock?.(); blocked = undefined },
   }
 }
+
+test("pending markers are discarded after a confirmed browser crash", async () => {
+  const f = fixture()
+  try {
+    f.failIdentification()
+    await assert.rejects(f.open("a"), /identification failed/)
+    f.crash()
+    await f.manager.release("a")
+    await f.manager.sweep()
+    assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).leaseHeld, false)
+  } finally { await f.manager.dispose() }
+})
+
+test("a confirmed changed endpoint invalidates old handles without adopting unknown tabs", async () => {
+  const f = fixture()
+  try {
+    const old = await f.open("a")
+    f.replace()
+    assert.deepEqual((await f.manager.inspectPages("a")).pages, [])
+    await assert.rejects(f.manager.execute("select_page", { pageId: old }, caller("a")), /Unknown, closed, or foreign/)
+    assert.deepEqual(parse(await f.manager.execute("list_pages", {}, caller("a"))).pages, [])
+  } finally { await f.manager.dispose() }
+})
+
+test("failed tab identification leaves a recoverable marker and release closes only that tab", async () => {
+  const f = fixture()
+  try {
+    await f.open("b")
+    f.failIdentification()
+    await assert.rejects(f.open("a"), /identification failed/)
+    assert.equal([...f.tabs.values()].filter((tab) => tab.url.startsWith("about:blank#opencode-browser-use-")).length, 1)
+    f.failCdp()
+    await assert.rejects(f.manager.release("a"), /disconnected/)
+    assert.equal([...f.tabs.values()].filter((tab) => tab.url.startsWith("about:blank#opencode-browser-use-")).length, 1)
+    await f.manager.release("a")
+    assert.equal([...f.tabs.values()].filter((tab) => tab.url.startsWith("about:blank#opencode-browser-use-")).length, 0)
+    assert.ok([...f.tabs.values()].some((tab) => tab.url === "https://b.test/"))
+  } finally { await f.manager.dispose() }
+})
+
+test("a disconnected metadata transport preserves ownership until reconnect succeeds", async (t) => {
+  const f = fixture()
+  let disconnected = false
+  let reconnectFails = true
+  t.mock.method(Cdp, "disconnected", () => disconnected)
+  t.mock.method(Cdp, "reconnect", async () => {
+    if (reconnectFails) throw new Error("reconnect failed")
+    disconnected = false
+  })
+  try {
+    const pageId = await f.open("a")
+    disconnected = true
+    await assert.rejects(f.manager.release("a"), /reconnect failed/)
+    await f.manager.sweep()
+    assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).pages[0].pageId, pageId)
+    reconnectFails = false
+    await f.manager.release("a")
+    assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).pages.length, 0)
+    assert.ok(![...f.tabs.values()].some((tab) => tab.url === "https://a.test/"))
+  } finally { await f.manager.dispose() }
+})
 
 test("status is lazy; concurrent sessions share one browser but get private handles and listings", async () => {
   const f = fixture()
@@ -316,7 +386,8 @@ test("already-selected visibility settings are no-ops, including headless before
   assert.equal(initial.running, false)
   assert.deepEqual(f.headlessLaunches, [])
   assert.equal(parse(await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a"))).changed, true)
-  assert.deepEqual(f.headlessLaunches, [false]) // Never launch headless just to immediately restart headed.
+  assert.deepEqual(f.headlessLaunches, [], "changing a stopped browser's visibility must not launch Chrome")
+  assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).activeLeases, 0)
   const a = await f.open("a")
   assert.equal(parse(await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a"))).changed, false)
   assert.equal(parse(await f.manager.execute("list_pages", {}, caller("a"))).pages[0].pageId, a)
@@ -331,6 +402,45 @@ test("invalid visibility settings are rejected without launching or restarting C
   }
   assert.deepEqual(f.headlessLaunches, [])
   await f.manager.dispose()
+})
+
+test("stopped visibility choices survive inspection and sweeps until the first browser operation", async () => {
+  const f = fixture()
+  f.manager.evictWhenIdle = true
+  try {
+    for (const visibility of ["headed", "headless", "headed"] as const) {
+      const changed = parse(await f.manager.execute("set_visibility", { visibility }, caller("a")))
+      assert.equal(changed.running, false)
+      assert.equal(changed.changed, true)
+      assert.deepEqual(f.headlessLaunches, [])
+      assert.equal((await f.manager.inspectPages("a")).visibility, visibility)
+      const status = parse(await f.manager.execute("status", {}, caller("a")))
+      assert.equal(status.activeLeases, 0)
+      assert.equal(status.leaseHeld, false)
+    }
+    f.advance(2000)
+    await f.manager.sweep()
+    assert.equal(f.manager.isRetired, false)
+    assert.equal((await f.manager.inspectPages("a")).visibility, "headed")
+    assert.deepEqual(f.headlessLaunches, [])
+    await f.open("a")
+    assert.deepEqual(f.headlessLaunches, [false])
+  } finally { await f.manager.dispose() }
+})
+
+test("changing visibility after a crash configures the next launch without restarting Chrome", async () => {
+  const f = fixture()
+  try {
+    await f.open("a")
+    f.crash()
+    const changed = parse(await f.manager.execute("set_visibility", { visibility: "headed" }, caller("b")))
+    assert.equal(changed.running, false)
+    assert.equal(changed.visibility, "headed")
+    assert.equal(parse(await f.manager.execute("status", {}, caller("b"))).leaseHeld, false)
+    assert.deepEqual(f.headlessLaunches, [true])
+    await f.open("b")
+    assert.deepEqual(f.headlessLaunches, [true, false])
+  } finally { await f.manager.dispose() }
 })
 
 test("visibility switches wait for in-flight browser operations to finish", async () => {
@@ -442,6 +552,7 @@ test("releasing a session during a failed visibility change never resurrects its
 test("idle shutdown resets the default to headless", async () => {
   const f = fixture()
   await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a"))
+  await f.open("a")
   await f.manager.release("a")
   f.advance(101)
   await f.manager.sweep()

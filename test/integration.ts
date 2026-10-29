@@ -13,6 +13,8 @@ import { loadCatalog } from "../src/mcp"
 import { options } from "../src/options"
 import { wrappedCatalog } from "../src/policy"
 import { emptySnapshot } from "../src/rpc"
+import { AttachChrome } from "../src/attach-chrome"
+import { BrowserRouter } from "../src/router"
 
 test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, restarts, locks, cleanup", { timeout: 180_000 }, async () => {
   const base = join(tmpdir(), "opencode")
@@ -113,6 +115,73 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
   }
 })
 
+test("attaching to a disposable existing Chrome only closes plugin-owned tabs and disconnects", { timeout: 120_000 }, async () => {
+  const base = join(tmpdir(), "opencode")
+  await mkdir(base, { recursive: true })
+  const directory = await mkdtemp(join(base, "browser-attach-test-"))
+  const config = options({ profileDirectory: join(directory, "profile") })
+  const chrome = new Chrome(config)
+  const manager = new BrowserManager(config, { chrome: new AttachChrome(config.profileDirectory) })
+  try {
+    const browser = await chrome.start(true)
+    const before = await browser.cdp.send<{ targetInfos: Array<{ targetId: string }> }>("Target.getTargets", { filter: [{ type: "tab" }] })
+    const caller = { sessionID: "attached", directory }
+    const result = await manager.execute("new_page", { url: "about:blank" }, caller)
+    const text = typeof result.content === "string" ? result.content : result.content.find((item) => item.type === "text")?.text
+    assert.equal(JSON.parse(text!).pages.length, 1)
+    await manager.execute("release", {}, caller)
+    await manager.dispose()
+    assert.equal(browser.alive(), true, "disconnect must not terminate the attached Chrome")
+    const after = await browser.cdp.send<{ targetInfos: Array<{ targetId: string }> }>("Target.getTargets", { filter: [{ type: "tab" }] })
+    for (const target of before.targetInfos) assert.ok(after.targetInfos.some((item) => item.targetId === target.targetId), "existing user tabs remain untouched")
+  } finally {
+    await manager.dispose()
+    await chrome.stop()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("isolated sessions have independent cookies retained after switching away", { timeout: 120_000 }, async () => {
+  const base = join(tmpdir(), "opencode")
+  await mkdir(base, { recursive: true })
+  const directory = await mkdtemp(join(base, "browser-isolation-test-"))
+  const config = options({ profileDirectory: join(directory, "profile") })
+  const values = new Map<string, string>()
+  const storage = { async get(key: string) { return values.get(key) }, async set(key: string, value: string) { values.set(key, value) }, async remove(key: string) { values.delete(key) } }
+  const router = new BrowserRouter(config, storage)
+  const server = createServer((request, response) => {
+    if (request.url === "/set") response.setHeader("Set-Cookie", "private_cookie=secret; Max-Age=3600; Path=/")
+    response.end("ok")
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+  const a = { sessionID: "isolated-a", directory }
+  const b = { sessionID: "isolated-b", directory }
+  const parse = (result: any) => JSON.parse(typeof result.content === "string" ? result.content : result.content[0].text)
+  try {
+    await router.setMode(a.sessionID, "isolated")
+    await router.setMode(b.sessionID, "isolated")
+    const pageA = parse(await router.execute("new_page", { url: `${origin}/set` }, a)).pages[0].pageId
+    const pageB = parse(await router.execute("new_page", { url: origin }, b)).pages[0].pageId
+    assert.doesNotMatch(JSON.stringify(await router.execute("evaluate_script", { pageId: pageB, function: "() => document.cookie" }, b)), /private_cookie/)
+    await router.setMode(a.sessionID, "shared")
+    assert.equal((await router.inspectPages(b.sessionID)).pages[0].pageId, pageB)
+    await assert.rejects(router.execute("take_snapshot", { pageId: pageA }, a), /foreign page handle/)
+    const shared = parse(await router.execute("new_page", { url: origin }, a)).pages[0].pageId
+    assert.doesNotMatch(JSON.stringify(await router.execute("evaluate_script", { pageId: shared, function: "() => document.cookie" }, a)), /private_cookie/)
+    await router.setMode(a.sessionID, "isolated")
+    const restored = parse(await router.execute("new_page", { url: origin }, a)).pages[0].pageId
+    assert.match(JSON.stringify(await router.execute("evaluate_script", { pageId: restored, function: "() => document.cookie" }, a)), /private_cookie=secret/)
+  } finally {
+    await router.delete(a.sessionID)
+    await router.delete(b.sessionID)
+    router.detach()
+    await router.shared.dispose()
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test("a crashed manager's Chrome is verified and reclaimed after the profile lock becomes stale", { timeout: 60_000 }, async () => {
   const base = join(tmpdir(), "opencode")
   await mkdir(base, { recursive: true })
@@ -146,7 +215,7 @@ test("a crashed manager's Chrome is verified and reclaimed after the profile loc
     await exited
     // Model the documented 30-second stale-lock interval without delaying the test.
     const past = new Date(Date.now() - 120_000)
-    await utimes(join(profileDirectory, ".opencode-browser-use.lock"), past, past)
+    await utimes(`${profileDirectory}.opencode-browser-use.lock`, past, past)
     const recovered = await chrome.start(true)
     assert.ok(recovered.alive())
     const current = JSON.parse(await readFile(join(profileDirectory, ".opencode-browser-use.json"), "utf8"))

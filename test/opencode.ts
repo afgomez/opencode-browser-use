@@ -33,14 +33,18 @@ test("the real OpenCode V2 server loads the explicitly configured local plugin a
   const port = (reservation.address() as { port: number }).port
   await new Promise<void>((resolve) => reservation.close(() => resolve()))
   const password = "browser-use-local-integration-test"
-  const child = spawn("opencode", ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
-    cwd: project,
-    env: { ...process.env, HOME: directory, XDG_CONFIG_HOME: join(directory, "config"), XDG_DATA_HOME: join(directory, "data"), XDG_CACHE_HOME: join(directory, "cache"), XDG_STATE_HOME: join(directory, "state"), OPENCODE_DB: ":memory:", OPENCODE_PASSWORD: password },
-    stdio: ["ignore", "pipe", "pipe"],
-  })
   let log = ""
-  child.stdout.on("data", (chunk) => { log = (log + String(chunk)).slice(-20_000) })
-  child.stderr.on("data", (chunk) => { log = (log + String(chunk)).slice(-20_000) })
+  const start = () => {
+    const child = spawn("opencode", ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
+      cwd: project,
+      env: { ...process.env, HOME: directory, XDG_CONFIG_HOME: join(directory, "config"), XDG_DATA_HOME: join(directory, "data"), XDG_CACHE_HOME: join(directory, "cache"), XDG_STATE_HOME: join(directory, "state"), OPENCODE_DB: join(directory, "opencode.db"), OPENCODE_PASSWORD: password },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    child.stdout.on("data", (chunk) => { log = (log + String(chunk)).slice(-20_000) })
+    child.stderr.on("data", (chunk) => { log = (log + String(chunk)).slice(-20_000) })
+    return child
+  }
+  let child = start()
   const headers = { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` }
   try {
     let loaded: any
@@ -70,7 +74,7 @@ test("the real OpenCode V2 server loads the explicitly configured local plugin a
     ])
     const browser = OpenCode.make({ baseUrl: `http://127.0.0.1:${port}`, headers }).rpc(BrowserUse)
     const request = { location: { directory: project } }
-    assert.deepEqual(await browser.pages({ sessionID: "sidebar-test" }, request), emptySnapshot())
+    assert.deepEqual(await browser.pages({ sessionID: "sidebar-test" }, request), { ...emptySnapshot(), mode: "shared" })
     for (const input of [{}, { sessionID: "" }, { sessionID: 1 }]) {
       await assert.rejects(browser.pages(input, request), { type: "rpc.invalid_input" })
     }
@@ -82,7 +86,21 @@ test("the real OpenCode V2 server loads the explicitly configured local plugin a
     assert.deepEqual(await browser.setVisibility({ sessionID: session.id, visibility: "headless" }, request), {}, "direct user control must ignore agent deny rules")
     await client.session.update({ sessionID: session.id, permissions: [{ action: "browser_use", resource: "*", effect: "allow" }] })
     assert.deepEqual(await browser.setVisibility({ sessionID: session.id, visibility: "headless" }, request), {})
-    assert.deepEqual(await browser.pages({ sessionID: session.id }, request), emptySnapshot())
+    assert.deepEqual(await browser.setMode({ sessionID: session.id, mode: "isolated" }, request), {})
+    assert.equal((await browser.pages({ sessionID: session.id }, request) as { mode: string }).mode, "isolated")
+    assert.equal((await browser.pages({ sessionID: "sidebar-test" }, request) as { mode: string }).mode, "shared")
+    await assert.rejects(browser.setMode({ sessionID: session.id, mode: "invalid" }, request), { type: "rpc.invalid_input" })
+    const exited = once(child, "exit")
+    child.kill("SIGTERM")
+    await exited
+    child = start()
+    let restored: unknown
+    for (let i = 0; i < 150; i++) {
+      try { restored = await browser.pages({ sessionID: session.id }, request); break } catch {}
+      if (child.exitCode !== null) throw new Error(`OpenCode exited after restart: ${log}`)
+      await delay(100)
+    }
+    assert.equal((restored as { mode?: string } | undefined)?.mode, "isolated", "mode survives a real service restart")
   } finally {
     const exited = once(child, "exit")
     child.kill("SIGTERM")

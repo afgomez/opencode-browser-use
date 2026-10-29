@@ -15,7 +15,7 @@ interface Lease { touched: number }
 interface Login { sessionID: string; deadline: number }
 interface RawPage { id: number; url: string; title: string }
 interface Dependencies {
-  chrome: Pick<Chrome, "start" | "stop">
+  chrome: Pick<Chrome, "start" | "stop"> & { current?(browser: BrowserProcess): Promise<boolean> }
   connect: typeof connectMcp
   now: () => number
 }
@@ -23,6 +23,7 @@ interface Dependencies {
 export class BrowserManager {
   private serial = new Serial()
   private pages = new Map<string, Page>()
+  private pendingPages = new Map<string, string>()
   private leases = new Map<string, Lease>()
   private browser?: BrowserProcess
   private mcp?: Mcp
@@ -36,15 +37,20 @@ export class BrowserManager {
   private restoration?: Page[]
   private visibility: BrowserVisibility = "headless"
   private retired = false
+  private retiredListeners = new Set<() => void>()
+  evictWhenIdle = false
+
+  get isRetired() { return this.retired }
 
   constructor(readonly config: Options, dependencies?: Partial<Dependencies>) {
     this.dependencies = { chrome: new Chrome(config), connect: connectMcp, now: Date.now, ...dependencies }
   }
 
-  attach(): () => void {
+  attach(onRetired?: () => void): () => void {
     this.assertActive()
     const reference = Symbol()
     this.references.add(reference)
+    if (onRetired) this.retiredListeners.add(onRetired)
     this.unreferencedAt = undefined
     if (!this.timer) {
       this.timer = setInterval(() => {
@@ -54,6 +60,7 @@ export class BrowserManager {
     }
     return () => {
       this.references.delete(reference)
+      if (onRetired) this.retiredListeners.delete(onRetired)
       if (!this.references.size) this.unreferencedAt = this.dependencies.now()
     }
   }
@@ -61,7 +68,7 @@ export class BrowserManager {
   async execute(name: string, input: Record<string, unknown>, caller: Caller) {
     if (!caller.sessionID) throw new Error("Browser tools require a trusted OpenCode session ID")
     return this.serial.run(async () => {
-      if (name === "status") return this.status(caller.sessionID)
+      if (name === "status") { await this.invalidateDeadBrowser(); return this.status(caller.sessionID) }
       if (name === "release") {
         await this.releaseSession(caller.sessionID)
         return { content: "Released this session's browser lease and closed its tabs." }
@@ -77,8 +84,16 @@ export class BrowserManager {
       if (this.login) throw new Error("Browser automation is paused for human login. The initiating session must call browser_use_login_finish.")
       if (name === "set_visibility") {
         const visibility = browserVisibility(input.visibility)
-        if (visibility === this.visibility && !this.restoration && (!this.browser || this.browser.alive())) {
-          if (this.browser) this.touch(caller.sessionID)
+        await this.invalidateDeadBrowser()
+        // Configure the next launch without creating a browser or a lease. A
+        // failed restoration is different: explicit retries must still recover it.
+        if (!this.browser && !this.restoration) {
+          const changed = visibility !== this.visibility
+          this.visibility = visibility
+          return { content: JSON.stringify({ visibility, changed, running: false, pages: [] }) }
+        }
+        if (visibility === this.visibility && !this.restoration) {
+          this.touch(caller.sessionID)
           return { content: JSON.stringify({ visibility, changed: false, running: !!this.browser, pages: this.publicPages(caller.sessionID) }) }
         }
         this.touch(caller.sessionID)
@@ -181,6 +196,7 @@ export class BrowserManager {
     if (!sessionID) throw new Error("Browser inspection requires a session ID")
     return this.serial.run(async () => {
       this.assertActive()
+      await this.invalidateDeadBrowser()
       const state = { visibility: this.visibility, paused: !!this.login || !!this.restoration }
       if (!this.browser?.alive()) return { ...state, pages: [] }
       const owned = [...this.pages.values()].filter((page) => page.sessionID === sessionID)
@@ -190,6 +206,7 @@ export class BrowserManager {
       // get_tab_id identifies the tab target, not its inner page target. Chrome
       // excludes tab targets by default, so request them explicitly.
       const browser = this.browser
+      if (Cdp.disconnected(browser.cdp)) await Cdp.reconnect(browser.cdp)
       const read = () => browser.cdp.send<{
         targetInfos: Array<{ targetId: string; type: string; title: string; url: string }>
       }>("Target.getTargets", { filter: [{ type: "tab" }] })
@@ -227,14 +244,21 @@ export class BrowserManager {
   }
 
   private async ensure() {
-    if (this.browser && !this.browser.alive()) {
+    await this.invalidateDeadBrowser()
+    if (!this.browser) this.browser = await this.dependencies.chrome.start(this.visibility === "headless")
+    if (Cdp.disconnected(this.browser.cdp)) await Cdp.reconnect(this.browser.cdp)
+    await this.cleanupPending()
+    if (!this.mcp) this.mcp = await this.dependencies.connect(this.config.nodePath, this.browser.url)
+  }
+
+  private async invalidateDeadBrowser() {
+    if (this.browser && (!this.browser.alive() || (this.dependencies.chrome.current && !await this.dependencies.chrome.current(this.browser)))) {
       await this.disconnect()
       this.browser = undefined
       this.pages.clear() // Browser crashes invalidate every old handle.
+      this.pendingPages.clear() // The old browser cannot contain recoverable tabs.
       await this.dependencies.chrome.stop()
     }
-    if (!this.browser) this.browser = await this.dependencies.chrome.start(this.visibility === "headless")
-    if (!this.mcp) this.mcp = await this.dependencies.connect(this.config.nodePath, this.browser.url)
   }
 
   private async call(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult> {
@@ -266,6 +290,7 @@ export class BrowserManager {
 
   private async createPage(sessionID: string, handle: string = randomUUID()): Promise<Page> {
     const marker = `about:blank#opencode-browser-use-${randomUUID()}`
+    this.pendingPages.set(marker, sessionID)
     const result = data(await this.call("new_page", { url: marker, background: true }))
     const raw = (result.pages as RawPage[] | undefined)?.find((page) => page.url === marker)
     if (!raw) throw new Error("Could not identify the newly created tab")
@@ -273,7 +298,24 @@ export class BrowserManager {
     if (typeof metadata.tabId !== "string") throw new Error("Could not identify the new Chrome tab")
     const page: Page = { pageId: handle, sessionID, upstreamId: raw.id, tabId: metadata.tabId, url: raw.url, title: raw.title }
     this.pages.set(handle, page)
+    this.pendingPages.delete(marker)
     return page
+  }
+
+  private async cleanupPending(sessionID?: string) {
+    const markers = [...this.pendingPages].filter(([, owner]) => !sessionID || owner === sessionID)
+    if (!markers.length) return
+    if (!this.browser?.alive()) throw new Error("Cannot recover pending browser tabs while Chrome is unavailable")
+    if (Cdp.disconnected(this.browser.cdp)) await Cdp.reconnect(this.browser.cdp)
+    const { targetInfos } = await this.browser.cdp.send<{ targetInfos: Array<{ targetId: string; type: string; url: string }> }>(
+      "Target.getTargets", { filter: [{ type: "tab" }] },
+    )
+    for (const [marker] of markers) {
+      for (const target of targetInfos.filter((target) => target.type === "tab" && target.url === marker)) {
+        await this.closeTab({ tabId: target.targetId } as Page)
+      }
+      this.pendingPages.delete(marker)
+    }
   }
 
   private async transition(headless: boolean) {
@@ -302,6 +344,8 @@ export class BrowserManager {
   async release(sessionID: string) { return this.serial.run(() => this.releaseSession(sessionID)) }
 
   private async releaseSession(sessionID: string) {
+    await this.invalidateDeadBrowser()
+    await this.cleanupPending(sessionID)
     if (this.login?.sessionID === sessionID) {
       await this.transition(true)
       this.login = undefined
@@ -310,7 +354,10 @@ export class BrowserManager {
     for (const page of this.pages.values()) {
       if (page.sessionID !== sessionID) continue
       // Stable CDP tab IDs, not potentially stale MCP indexes.
-      if (this.browser?.alive()) await this.closeTab(page)
+      if (this.browser?.alive()) {
+        if (Cdp.disconnected(this.browser.cdp)) await Cdp.reconnect(this.browser.cdp)
+        await this.closeTab(page)
+      }
       this.pages.delete(page.pageId)
     }
     this.leases.delete(sessionID)
@@ -328,12 +375,7 @@ export class BrowserManager {
     return this.serial.run(async () => {
       if (this.retired) return
       const now = this.dependencies.now()
-      if (this.browser && !this.browser.alive()) {
-        await this.disconnect()
-        await this.dependencies.chrome.stop()
-        this.browser = undefined
-        this.pages.clear()
-      }
+      await this.invalidateDeadBrowser()
       if (this.login && now >= this.login.deadline) {
         await this.transition(true)
         this.login = undefined
@@ -350,6 +392,9 @@ export class BrowserManager {
       if (unloaded && !this.browser && !this.mcp && !this.leases.size && !this.login && !this.restoration) {
         this.retire()
       }
+      // Preserve a headed selection made before launch; evicting that manager
+      // would silently recreate it with the default headless visibility.
+      if (this.evictWhenIdle && this.visibility === "headless" && this.serial.queued === 1 && !this.browser && !this.mcp && !this.leases.size && !this.login && !this.restoration && !this.pendingPages.size) this.retire(true)
       this.maintenanceError = undefined
     })
   }
@@ -369,11 +414,14 @@ export class BrowserManager {
     this.visibility = "headless"
   }
 
-  private retire() {
-    if (this.references.size) return
+  private retire(force = false) {
+    if (this.references.size && !force) return
     if (this.timer) clearInterval(this.timer)
     this.timer = undefined
     this.retired = true
+    for (const listener of this.retiredListeners) listener()
+    this.retiredListeners.clear()
+    this.references.clear()
     // A stale cleanup must never evict a newer owner of the same profile.
     if (managers.get(this.config.profileDirectory) === this) managers.delete(this.config.profileDirectory)
   }
@@ -387,7 +435,7 @@ export class BrowserManager {
       this.login = undefined
       this.restoration = undefined
       await this.stop()
-      this.retire()
+      this.retire(this.evictWhenIdle)
     })
   }
 
@@ -398,6 +446,8 @@ export class BrowserManager {
     if (connect) manager.dependencies.connect = connect
     // Migrate live managers from the old field without changing browser visibility.
     const legacy = manager as BrowserManager & { mode?: BrowserVisibility }
+    manager.pendingPages ??= new Map()
+    manager.retiredListeners ??= new Set()
     manager.visibility ??= legacy.mode ?? (manager.login ? "headed" : "headless")
     delete legacy.mode
   }

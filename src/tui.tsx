@@ -16,7 +16,7 @@ export function BrowserSidebar(props: { sessionID: string; visibility?: Visibili
   const [visibilityHovered, setVisibilityHovered] = createSignal(false)
   // The filled control style is "focused"; base/selected may be transparent.
   // This is visual styling only and does not steal keyboard focus.
-  const visibilityButtonState = () => ({ disabled: busy() || snapshot().paused, focused: true })
+  const visibilityButtonState = () => ({ disabled: unavailable() || busy() || snapshot().paused, focused: true })
   const visibilityButtonBackground = () => {
     const state = visibilityButtonState()
     const color = context.theme.background.action.primary.state(state)
@@ -42,51 +42,53 @@ export function BrowserSidebar(props: { sessionID: string; visibility?: Visibili
   async function chooseVisibility() {
     const current = view
     if (!current || current.signal.aborted || unavailable() || busy() || snapshot().paused) return
-    const updated = await visibility.choose(current, undefined, snapshot())
+    const updated = await visibility.settings(current, snapshot())
     if (updated && !current.signal.aborted) setSnapshot(updated)
   }
   return (
-    <Show when={snapshot().pages.length > 0 || unavailable()}>
-      <box flexDirection="column" gap={1} paddingTop={1} flexShrink={0}>
-        <box flexDirection="column">
-          <box flexDirection="row" gap={1} justifyContent="space-between">
-            <text fg={context.theme.text.base} width={0} flexGrow={1} flexShrink={1} minWidth={0} height={1} wrapMode="none" truncate>
-              <strong>Browser use<Show when={!unavailable()}> · {snapshot().pages.length} {snapshot().pages.length === 1 ? "tab" : "tabs"}</Show></strong>
-            </text>
-            <Show when={!unavailable()}>
-              <box flexDirection="row" flexShrink={0}>
-                <Show when={switching()} fallback={<>
-                <box
-                  backgroundColor={visibilityButtonBackground()}
-                  paddingLeft={1} paddingRight={1} height={1} flexShrink={0}
-                  onMouseOver={() => setVisibilityHovered(true)}
-                  onMouseOut={() => setVisibilityHovered(false)}
-                  // Open after release, so the opening click cannot dismiss the dialog.
-                  onMouseUp={(event) => { if (event.button === 0) { event.stopPropagation(); void chooseVisibility() } }}
-                >
-                  <text fg={context.theme.text.action.primary.state(visibilityButtonState())}>
-                    <strong>{snapshot().visibility === "headless" ? "Headless" : "Headed"}</strong> ▾
-                  </text>
-                </box>
-                <Show when={snapshot().paused}><text fg={context.theme.text.muted}> (paused)</text></Show>
-                </>}>
-                  <Spinner />
-                </Show>
+    <box flexDirection="column" gap={1} paddingTop={1} flexShrink={0}>
+      <box flexDirection="column">
+        <box flexDirection="row" gap={1} justifyContent="space-between">
+          <text fg={context.theme.text.base} width={0} flexGrow={1} flexShrink={1} minWidth={0} height={1} wrapMode="none" truncate>
+            <strong>Browser use<Show when={!unavailable()}> · {snapshot().pages.length} {snapshot().pages.length === 1 ? "tab" : "tabs"}</Show></strong>
+          </text>
+          <box flexDirection="row" flexShrink={0}>
+            <Show when={switching()} fallback={<>
+              <box
+                backgroundColor={visibilityButtonBackground()}
+                paddingLeft={1} paddingRight={1} height={1} flexShrink={0}
+                onMouseOver={() => setVisibilityHovered(true)}
+                onMouseOut={() => setVisibilityHovered(false)}
+                // Open after release, so the opening click cannot dismiss the dialog.
+                onMouseUp={(event) => { if (event.button === 0) { event.stopPropagation(); void chooseVisibility() } }}
+              >
+                <text fg={context.theme.text.action.primary.state(visibilityButtonState())}>
+                  <strong>Settings</strong>
+                </text>
               </box>
+              <Show when={snapshot().paused}><text fg={context.theme.text.muted}> (paused)</text></Show>
+            </>}>
+              <Spinner />
             </Show>
           </box>
-          <Show when={unavailable()}>
-            <text fg={context.theme.text.muted}>Browser connection unavailable; retrying…</text>
-          </Show>
         </box>
-        <For each={snapshot().pages}>{(page) => (
-          <box flexDirection="column" flexShrink={0} paddingLeft={2}>
-            <text fg={context.theme.text.base} height={1} wrapMode="none" truncate content={singleLine(page.title) || "Untitled"} />
-            <text fg={context.theme.text.muted} height={1} wrapMode="none" truncate content={singleLine(page.url)} />
-          </box>
-        )}</For>
+        <Show when={!unavailable()}>
+          <text fg={context.theme.text.muted} height={1} wrapMode="none" truncate>
+            {snapshot().mode === "attach" ? "Attach" : snapshot().mode === "isolated" ? "Isolated" : "Shared"}
+            <Show when={snapshot().mode !== "attach" && snapshot().visibility}> / {snapshot().visibility === "headless" ? "Headless" : "Headed"}</Show>
+          </text>
+        </Show>
+        <Show when={unavailable()}>
+          <text fg={context.theme.text.muted}>Browser connection unavailable; retrying…</text>
+        </Show>
       </box>
-    </Show>
+      <For each={snapshot().pages}>{(page) => (
+        <box flexDirection="column" flexShrink={0} paddingLeft={2}>
+          <text fg={context.theme.text.base} height={1} wrapMode="none" truncate content={singleLine(page.title) || "Untitled"} />
+          <text fg={context.theme.text.muted} height={1} wrapMode="none" truncate content={singleLine(page.url)} />
+        </box>
+      )}</For>
+    </box>
   )
 }
 

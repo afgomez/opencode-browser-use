@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process"
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises"
+import { mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import lockfile from "proper-lockfile"
@@ -29,24 +29,7 @@ export class Chrome {
   constructor(private config: Options) {}
 
   async start(headless: boolean): Promise<BrowserProcess> {
-    if (this.compromised) throw new Error("Browser profile lock was lost; reload the plugin before continuing")
-    const profile = this.config.profileDirectory
-    await mkdir(profile, { recursive: true, mode: 0o700 })
-    if (!this.unlock) {
-      try {
-        this.unlock = await lockfile.lock(profile, {
-          lockfilePath: join(profile, ".opencode-browser-use.lock"),
-          stale: 30_000, update: 10_000, retries: 0,
-          onCompromised: () => {
-            this.compromised = true
-            // Do not keep controlling a browser after losing exclusive ownership.
-            this.browser?.cdp.close()
-          },
-        })
-      } catch {
-        throw new Error("This browser profile is managed by another OpenCode service. Use that service or a different profileDirectory.")
-      }
-    }
+    await this.lock()
     try {
       // A service crash can leave Chrome alive. Reattach only to an advertisement
       // we wrote, and verify the browser's exact profile before trusting it.
@@ -61,6 +44,38 @@ export class Chrome {
       await this.release()
       throw error
     }
+  }
+
+  private async lock() {
+    if (this.compromised) throw new Error("Browser profile lock was lost; reload the plugin before continuing")
+    const profile = this.config.profileDirectory
+    await mkdir(profile, { recursive: true, mode: 0o700 })
+    if (!this.unlock) {
+      try {
+        this.unlock = await lockfile.lock(profile, {
+          // The lock must survive removal of the profile itself.
+          lockfilePath: `${profile}.opencode-browser-use.lock`,
+          stale: 30_000, update: 10_000, retries: 0,
+          onCompromised: () => {
+            this.compromised = true
+            // Do not keep controlling a browser after losing exclusive ownership.
+            this.browser?.cdp.close()
+          },
+        })
+      } catch {
+        throw new Error("This browser profile is managed by another OpenCode service. Use that service or a different profileDirectory.")
+      }
+    }
+  }
+
+  /** On session deletion stop a verified survivor before removing its profile. */
+  async removeProfile(): Promise<void> {
+    await this.lock()
+    try {
+      this.browser ??= await this.recover()
+      if (this.browser) { await this.browser.stop(); this.browser = undefined }
+      await rm(this.config.profileDirectory, { recursive: true, force: true })
+    } finally { await this.release() }
   }
 
   private async recover(): Promise<BrowserProcess | undefined> {
