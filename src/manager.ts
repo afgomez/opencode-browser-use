@@ -1,0 +1,369 @@
+import { randomUUID } from "node:crypto"
+import { isAbsolute, resolve } from "node:path"
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
+import { Chrome, type BrowserProcess } from "./chrome"
+import { connectMcp, type Mcp } from "./mcp"
+import type { Options } from "./options"
+import { browserMode, data, filteredResult, pageTools, type BrowserMode, type PublicPage } from "./policy"
+import { Serial } from "./serial"
+
+export interface Caller { sessionID: string; directory: string; signal?: AbortSignal }
+interface Page extends PublicPage { sessionID: string; tabId: string; upstreamId: number }
+interface Lease { touched: number }
+interface Login { sessionID: string; deadline: number }
+interface RawPage { id: number; url: string; title: string }
+interface Dependencies {
+  chrome: Pick<Chrome, "start" | "stop">
+  connect: typeof connectMcp
+  now: () => number
+}
+
+export class BrowserManager {
+  private serial = new Serial()
+  private pages = new Map<string, Page>()
+  private leases = new Map<string, Lease>()
+  private browser?: BrowserProcess
+  private mcp?: Mcp
+  private login?: Login
+  private references = new Set<symbol>()
+  private unreferencedAt?: number
+  private idleAt?: number
+  private timer?: NodeJS.Timeout
+  private dependencies: Dependencies
+  private maintenanceError?: string
+  private restoration?: Page[]
+  private mode: BrowserMode = "headless"
+
+  constructor(readonly config: Options, dependencies?: Partial<Dependencies>) {
+    this.dependencies = { chrome: new Chrome(config), connect: connectMcp, now: Date.now, ...dependencies }
+  }
+
+  attach(): () => void {
+    const reference = Symbol()
+    this.references.add(reference)
+    this.unreferencedAt = undefined
+    if (!this.timer) {
+      this.timer = setInterval(() => {
+        void this.sweep().catch((error) => { this.maintenanceError = String(error) })
+      }, Math.min(15_000, this.config.idleTimeoutMs, this.config.unloadGraceMs))
+      this.timer.unref()
+    }
+    return () => {
+      this.references.delete(reference)
+      if (!this.references.size) this.unreferencedAt = this.dependencies.now()
+    }
+  }
+
+  async execute(name: string, input: Record<string, unknown>, caller: Caller) {
+    if (!caller.sessionID) throw new Error("Browser tools require a trusted OpenCode session ID")
+    return this.serial.run(async () => {
+      if (name === "status") return this.status(caller.sessionID)
+      if (name === "release") {
+        await this.releaseSession(caller.sessionID)
+        return { content: "Released this session's browser lease and closed its tabs." }
+      }
+      if (name === "login_finish") {
+        if (!this.login || this.login.sessionID !== caller.sessionID) throw new Error("Only the session that started login can finish it")
+        await this.transition(true)
+        this.login = undefined
+        this.touch(caller.sessionID)
+        return { content: "Headless operation resumed. Cookies persist; pages were reloaded. Take fresh snapshots." }
+      }
+      if (this.login) throw new Error("Browser automation is paused for human login. The initiating session must call browser_use_login_finish.")
+      if (name === "switch_mode") {
+        const mode = browserMode(input.mode)
+        if (mode === this.mode && !this.restoration && (!this.browser || this.browser.alive())) {
+          if (this.browser) this.touch(caller.sessionID)
+          return { content: JSON.stringify({ mode, changed: false, running: !!this.browser, pages: this.publicPages(caller.sessionID) }) }
+        }
+        this.touch(caller.sessionID)
+        await this.transition(mode === "headless")
+        if (mode === "headed") {
+          // Show only the requesting session's tab, never another session's tab.
+          const page = [...this.pages.values()].find((page) => page.sessionID === caller.sessionID)
+          if (page) await this.browser!.cdp.send("Target.activateTarget", { targetId: page.tabId })
+        }
+        return { content: JSON.stringify({
+          mode, changed: true, running: true, paused: false,
+          message: "Browser automation remains enabled. All owned tabs were reloaded; take fresh snapshots.",
+          pages: this.publicPages(caller.sessionID),
+        }) }
+      }
+      if (this.restoration) throw new Error("A browser mode transition failed; automation is paused. Retry browser_use_switch_mode to finish restoring tabs.")
+      this.touch(caller.sessionID)
+      await this.ensure()
+      await this.mcp!.roots(caller.directory)
+      if (name === "login_start") {
+        const page = this.owned(input.pageId, caller.sessionID)
+        await this.refresh()
+        if (!this.pages.has(page.pageId)) throw new Error("This page has closed")
+        this.login = { sessionID: caller.sessionID, deadline: this.dependencies.now() + this.config.loginTimeoutMs }
+        try {
+          await this.transition(false)
+          // Focus only at the explicit human handoff, never ordinary automation.
+          const restored = this.owned(page.pageId, caller.sessionID)
+          await this.browser!.cdp.send("Target.activateTarget", { targetId: restored.tabId })
+        } catch (error) {
+          // Remain paused: a failed transition must not silently enable automation
+          // in a partly restored headed browser. login_finish can retry recovery.
+          throw error
+        }
+        return { content: "Chrome is open for human login; all browser automation is paused. When finished, call browser_use_login_finish. Tabs were reloaded; snapshots are stale." }
+      }
+      if (name === "new_page") {
+        if (typeof input.url !== "string") throw new Error("url is required")
+        const page = await this.createPage(caller.sessionID)
+        const result = await this.call("navigate_page", {
+          pageId: page.upstreamId, url: input.url, ...(input.timeout === undefined ? {} : { timeout: input.timeout }),
+        }, caller.signal)
+        await this.refresh()
+        if (!this.pages.has(page.pageId)) return { content: "The newly opened tab closed. Call browser_use_list_pages." }
+        return filteredResult(result, this.publicPages(caller.sessionID))
+      }
+      if (name === "list_pages") {
+        await this.refresh()
+        return { content: JSON.stringify({ pages: this.publicPages(caller.sessionID) }) }
+      }
+      // Reject before any target lookup or page operation. Identity never comes
+      // from model-supplied input, and raw upstream numeric IDs are not accepted.
+      let page = this.owned(input.pageId, caller.sessionID)
+      if (!(pageTools.has(name) || name === "close_page" || name === "select_page")) throw new Error("Unsupported browser operation")
+      if ("serviceWorkerId" in input) throw new Error("Service-worker access is not session scoped and is disabled")
+      if (input.bringToFront === true) throw new Error("Use browser_use_login_start for an explicit headed handoff")
+      await this.refresh()
+      page = this.owned(page.pageId, caller.sessionID)
+      if (name === "close_page") {
+        await this.closeTab(page)
+        this.pages.delete(page.pageId)
+        return { content: JSON.stringify({ pages: this.publicPages(caller.sessionID) }) }
+      }
+      // There is deliberately no shared selected-page state in our API.
+      if (name === "select_page") return { content: JSON.stringify(pageView(page)) }
+      const args: Record<string, unknown> = { ...input, pageId: page.upstreamId }
+      for (const key of ["filePath", "sourcePath", "requestFilePath", "responseFilePath"]) {
+        if (typeof args[key] === "string" && !isAbsolute(args[key])) args[key] = resolve(caller.directory, args[key])
+      }
+      if (Array.isArray(args.filePaths)) args.filePaths = args.filePaths.map((path: string) => resolve(caller.directory, path))
+      const result = await this.call(name, args, caller.signal)
+      // Update ownership metadata, but never adopt unknown human/popup tabs.
+      await this.refresh()
+      if (!this.pages.has(page.pageId)) return { content: "The target tab closed during this operation. Call browser_use_list_pages." }
+      return filteredResult(result, this.publicPages(caller.sessionID))
+    }, caller.signal)
+  }
+
+  private touch(sessionID: string) {
+    this.leases.set(sessionID, { touched: this.dependencies.now() })
+    this.idleAt = undefined
+  }
+
+  private owned(id: unknown, sessionID: string): Page {
+    const page = typeof id === "string" ? this.pages.get(id) : undefined
+    if (!page || page.sessionID !== sessionID) throw new Error("Unknown, closed, or foreign page handle. Call browser_use_list_pages or browser_use_new_page.")
+    return page
+  }
+
+  private publicPages(sessionID: string): PublicPage[] {
+    return [...this.pages.values()].filter((page) => page.sessionID === sessionID).map(pageView)
+  }
+
+  private status(sessionID: string) {
+    return { content: JSON.stringify({
+      running: this.browser?.alive() ?? false,
+      mode: this.mode,
+      paused: !!this.login || !!this.restoration,
+      loginOwnedByThisSession: this.login?.sessionID === sessionID,
+      leaseHeld: this.leases.has(sessionID),
+      activeLeases: this.leases.size,
+      pages: this.publicPages(sessionID),
+      ...(this.maintenanceError ? { maintenanceError: this.maintenanceError } : {}),
+    }) }
+  }
+
+  private async ensure() {
+    if (this.browser && !this.browser.alive()) {
+      await this.disconnect()
+      this.browser = undefined
+      this.pages.clear() // Browser crashes invalidate every old handle.
+      await this.dependencies.chrome.stop()
+    }
+    if (!this.browser) this.browser = await this.dependencies.chrome.start(this.mode === "headless")
+    if (!this.mcp) this.mcp = await this.dependencies.connect(this.config.nodePath, this.browser.url)
+  }
+
+  private async call(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult> {
+    try { return await this.mcp!.call(name, args, signal) } catch (error) {
+      // Do not retry side effects. The next operation reconnects and remaps stable
+      // tab identities; stale MCP indexes must never hit someone else's tab.
+      await this.disconnect()
+      throw error
+    }
+  }
+
+  private async refresh() {
+    const result = data(await this.call("list_pages", {}))
+    if (!Array.isArray(result.pages)) throw new Error("Invalid MCP page catalog")
+    const byTab = new Map<string, RawPage>()
+    for (const raw of result.pages as RawPage[]) {
+      const metadata = data(await this.call("get_tab_id", { pageId: raw.id }))
+      if (typeof metadata.tabId !== "string") throw new Error("MCP stable tab identification is unavailable")
+      byTab.set(metadata.tabId, raw)
+    }
+    for (const page of this.pages.values()) {
+      const raw = byTab.get(page.tabId)
+      if (!raw) { this.pages.delete(page.pageId); continue }
+      page.upstreamId = raw.id
+      page.url = raw.url
+      page.title = raw.title
+    }
+  }
+
+  private async createPage(sessionID: string, handle: string = randomUUID()): Promise<Page> {
+    const marker = `about:blank#opencode-browser-use-${randomUUID()}`
+    const result = data(await this.call("new_page", { url: marker, background: true }))
+    const raw = (result.pages as RawPage[] | undefined)?.find((page) => page.url === marker)
+    if (!raw) throw new Error("Could not identify the newly created tab")
+    const metadata = data(await this.call("get_tab_id", { pageId: raw.id }))
+    if (typeof metadata.tabId !== "string") throw new Error("Could not identify the new Chrome tab")
+    const page: Page = { pageId: handle, sessionID, upstreamId: raw.id, tabId: metadata.tabId, url: raw.url, title: raw.title }
+    this.pages.set(handle, page)
+    return page
+  }
+
+  private async transition(headless: boolean) {
+    if (!this.restoration) {
+      if (this.mcp && this.browser?.alive()) await this.refresh()
+      this.restoration = [...this.pages.values()].map((page) => ({ ...page }))
+    }
+    await this.disconnect()
+    await this.dependencies.chrome.stop(false)
+    this.browser = undefined
+    this.pages.clear()
+    this.browser = await this.dependencies.chrome.start(headless)
+    this.mode = headless ? "headless" : "headed"
+    this.mcp = await this.dependencies.connect(this.config.nodePath, this.browser.url)
+    for (const saved of this.restoration) {
+      const page = await this.createPage(saved.sessionID, saved.pageId)
+      // Do not replay javascript/data/file URLs or form submissions during login.
+      if (/^https?:\/\//i.test(saved.url)) {
+        await this.call("navigate_page", { pageId: page.upstreamId, url: saved.url })
+      }
+    }
+    await this.refresh()
+    this.restoration = undefined
+  }
+
+  async release(sessionID: string) { return this.serial.run(() => this.releaseSession(sessionID)) }
+
+  private async releaseSession(sessionID: string) {
+    if (this.login?.sessionID === sessionID) {
+      await this.transition(true)
+      this.login = undefined
+    }
+    if (this.restoration) this.restoration = this.restoration.filter((page) => page.sessionID !== sessionID)
+    for (const page of this.pages.values()) {
+      if (page.sessionID !== sessionID) continue
+      // Stable CDP tab IDs, not potentially stale MCP indexes.
+      if (this.browser?.alive()) await this.closeTab(page)
+      this.pages.delete(page.pageId)
+    }
+    this.leases.delete(sessionID)
+    if (!this.leases.size && this.idleAt === undefined) this.idleAt = this.dependencies.now()
+  }
+
+  private async closeTab(page: Page) {
+    try { await this.browser!.cdp.send("Target.closeTarget", { targetId: page.tabId }) } catch (error) {
+      // A human may have closed an owned tab since our last catalog refresh.
+      if (!(error instanceof Error) || !/No target|not found|already closed/i.test(error.message)) throw error
+    }
+  }
+
+  async sweep() {
+    return this.serial.run(async () => {
+      const now = this.dependencies.now()
+      if (this.browser && !this.browser.alive()) {
+        await this.disconnect()
+        await this.dependencies.chrome.stop()
+        this.browser = undefined
+        this.pages.clear()
+      }
+      if (this.login && now >= this.login.deadline) {
+        await this.transition(true)
+        this.login = undefined
+      }
+      const unloaded = this.unreferencedAt !== undefined && now - this.unreferencedAt >= this.config.unloadGraceMs
+      for (const [sessionID, lease] of this.leases) {
+        if (unloaded || now - lease.touched >= this.config.leaseTimeoutMs) await this.releaseSession(sessionID)
+      }
+      if (!this.leases.size && this.browser) {
+        this.idleAt ??= now
+        if (now - this.idleAt >= this.config.idleTimeoutMs) await this.stop()
+      }
+      if (unloaded && !this.browser && this.timer) {
+        clearInterval(this.timer)
+        this.timer = undefined
+      }
+      this.maintenanceError = undefined
+    })
+  }
+
+  private async disconnect() {
+    const mcp = this.mcp
+    this.mcp = undefined
+    await mcp?.close().catch(() => {})
+  }
+
+  private async stop() {
+    await this.disconnect()
+    await this.dependencies.chrome.stop()
+    this.browser = undefined
+    this.pages.clear()
+    this.restoration = undefined
+    this.mode = "headless"
+  }
+
+  /** Explicit shutdown for integration tests and service-level owners. */
+  async dispose() {
+    return this.serial.run(async () => {
+      if (this.timer) clearInterval(this.timer)
+      this.timer = undefined
+      this.leases.clear()
+      this.login = undefined
+      this.restoration = undefined
+      await this.stop()
+    })
+  }
+
+  /** Additive hot reloads keep live leases/tabs and the existing serialization queue. */
+  static upgrade(manager: BrowserManager, connect?: typeof connectMcp) {
+    Object.setPrototypeOf(manager, BrowserManager.prototype)
+    // A relocated plugin must resolve future MCP subprocesses from its new path.
+    if (connect) manager.dependencies.connect = connect
+    // Pre-switch_mode managers had no mode field; their login state determines it.
+    manager.mode ??= manager.login ? "headed" : "headless"
+  }
+}
+
+function pageView(page: Page): PublicPage {
+  return { pageId: page.pageId, url: page.url, title: page.title }
+}
+
+// OpenCode instantiates plugins per location and reloads modules. A process-global
+// registry keeps one owner across those instances, rather than one per import.
+const key = Symbol.for("opencode.browser-use.managers.v1")
+const root = globalThis as typeof globalThis & { [key]?: Map<string, BrowserManager> }
+const managers = root[key] ??= new Map()
+
+export function sharedManager(config: Options): BrowserManager {
+  const current = managers.get(config.profileDirectory)
+  if (current) {
+    if (JSON.stringify(current.config) !== JSON.stringify(config)) {
+      throw new Error("Browser plugin instances sharing a profile must use identical options")
+    }
+    BrowserManager.upgrade(current, connectMcp)
+    return current
+  }
+  const manager = new BrowserManager(config)
+  managers.set(config.profileDirectory, manager)
+  return manager
+}

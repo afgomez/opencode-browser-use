@@ -1,0 +1,27 @@
+{
+  "name": "opencode-browser-use",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Session-owned persistent Chrome automation for OpenCode V2",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "files": ["index.ts", "src", "README.md"],
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "test:integration": "tsx --test test/integration.ts",
+    "test:opencode": "tsx --test test/opencode.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@opencode/plugin": "2.2.0",
+    "chrome-devtools-mcp": "1.12.0",
+    "proper-lockfile": "4.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "26.0.0",
+    "@types/proper-lockfile": "4.1.4",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
+  }
+}
