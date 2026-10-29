@@ -465,10 +465,60 @@ test("error results cannot leak raw global page text; screenshots remain attachm
   assert.ok(!JSON.stringify(result).includes("SECRET"))
 })
 
-test("per-location instances share a process-wide manager and conflicting options fail", () => {
+test("per-location instances share a process-wide manager and conflicting options fail", async () => {
   const one = sharedManager(config())
-  assert.equal(sharedManager(config()), one)
-  assert.throws(() => sharedManager({ ...config(), idleTimeoutMs: 200 }), /identical options/)
+  const detach = one.attach()
+  try {
+    assert.equal(sharedManager(config()), one)
+    assert.throws(() => sharedManager({ ...config(), idleTimeoutMs: 200 }), /identical options/)
+    // Explicit shutdown must not remove a manager still held by a loaded location.
+    await one.dispose()
+    assert.equal(sharedManager(config()), one)
+    assert.throws(() => sharedManager({ ...config(), idleTimeoutMs: 200 }), /identical options/)
+  } finally { detach(); await one.dispose() }
+})
+
+test("disposed shared managers allow new options without letting stale owners evict or restart them", async () => {
+  const original = { ...config(), profileDirectory: "/test/shared-disposed" }
+  const one = sharedManager(original)
+  await one.dispose()
+  const updated = { ...original, idleTimeoutMs: 200 }
+  const two = sharedManager(updated)
+  const detach = two.attach()
+  try {
+    assert.notEqual(two, one)
+    assert.deepEqual(two.config, updated)
+    assert.throws(() => one.attach(), /unloaded/)
+    await assert.rejects(one.execute("new_page", { url: "https://stale.test/" }, caller("stale")), /unloaded/)
+    await one.dispose()
+    await one.sweep()
+    assert.equal(sharedManager(updated), two)
+  } finally { detach(); await two.dispose() }
+})
+
+test("fully unloaded shared managers allow new options after the unload grace period", async (t) => {
+  let now = 0
+  t.mock.method(Date, "now", () => now)
+  const original = { ...config(), profileDirectory: "/test/shared-unloaded" }
+  const updated = { ...original, leaseTimeoutMs: 2000 }
+  const one = sharedManager(original)
+  const detach = one.attach()
+  detach()
+  try {
+    now = original.unloadGraceMs - 1
+    await one.sweep()
+    assert.equal(sharedManager(original), one)
+    assert.throws(() => sharedManager(updated), /identical options/)
+
+    now += 2
+    await one.sweep()
+    const two = sharedManager(updated)
+    try {
+      assert.notEqual(two, one)
+      assert.deepEqual(two.config, updated)
+      assert.throws(() => one.attach(), /unloaded/)
+    } finally { await two.dispose() }
+  } finally { await one.dispose() }
 })
 
 test("all tools share one permission action and expose their operation as the resource", () => {

@@ -133,6 +133,8 @@ the broad `*` rule because the last matching rule wins.
 - With no leases, Chrome exits after a one-minute idle grace period.
 - Plugin unload has a 30-second grace period so reloads do not immediately
   discard active tabs. Other loaded locations retain the shared manager.
+  Once fully unloaded and stopped, the manager is removed from the registry so
+  a later load can use different options for that profile without a service restart.
 - A heartbeat-backed exclusive profile lock prevents other services from using
   this profile. Cross-service sharing is intentionally unsupported. After an
   abrupt service crash, wait up to 30 seconds for the stale lock to expire.

@@ -33,12 +33,14 @@ export class BrowserManager {
   private maintenanceError?: string
   private restoration?: Page[]
   private mode: BrowserMode = "headless"
+  private retired = false
 
   constructor(readonly config: Options, dependencies?: Partial<Dependencies>) {
     this.dependencies = { chrome: new Chrome(config), connect: connectMcp, now: Date.now, ...dependencies }
   }
 
   attach(): () => void {
+    this.assertActive()
     const reference = Symbol()
     this.references.add(reference)
     this.unreferencedAt = undefined
@@ -62,6 +64,7 @@ export class BrowserManager {
         await this.releaseSession(caller.sessionID)
         return { content: "Released this session's browser lease and closed its tabs." }
       }
+      this.assertActive()
       if (name === "login_finish") {
         if (!this.login || this.login.sessionID !== caller.sessionID) throw new Error("Only the session that started login can finish it")
         await this.transition(true)
@@ -155,6 +158,10 @@ export class BrowserManager {
   private touch(sessionID: string) {
     this.leases.set(sessionID, { touched: this.dependencies.now() })
     this.idleAt = undefined
+  }
+
+  private assertActive() {
+    if (this.retired) throw new Error("Browser manager was unloaded; reload the plugin before continuing")
   }
 
   private owned(id: unknown, sessionID: string): Page {
@@ -280,6 +287,7 @@ export class BrowserManager {
 
   async sweep() {
     return this.serial.run(async () => {
+      if (this.retired) return
       const now = this.dependencies.now()
       if (this.browser && !this.browser.alive()) {
         await this.disconnect()
@@ -299,9 +307,8 @@ export class BrowserManager {
         this.idleAt ??= now
         if (now - this.idleAt >= this.config.idleTimeoutMs) await this.stop()
       }
-      if (unloaded && !this.browser && this.timer) {
-        clearInterval(this.timer)
-        this.timer = undefined
+      if (unloaded && !this.browser && !this.mcp && !this.leases.size && !this.login && !this.restoration) {
+        this.retire()
       }
       this.maintenanceError = undefined
     })
@@ -322,6 +329,15 @@ export class BrowserManager {
     this.mode = "headless"
   }
 
+  private retire() {
+    if (this.references.size) return
+    if (this.timer) clearInterval(this.timer)
+    this.timer = undefined
+    this.retired = true
+    // A stale cleanup must never evict a newer owner of the same profile.
+    if (managers.get(this.config.profileDirectory) === this) managers.delete(this.config.profileDirectory)
+  }
+
   /** Explicit shutdown for integration tests and service-level owners. */
   async dispose() {
     return this.serial.run(async () => {
@@ -331,6 +347,7 @@ export class BrowserManager {
       this.login = undefined
       this.restoration = undefined
       await this.stop()
+      this.retire()
     })
   }
 
