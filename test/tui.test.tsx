@@ -316,6 +316,15 @@ test("custom settings applies a selection through confirmation and closes on ses
     await changing
     assert.equal(calls, 1)
     assert.equal(dialog(), undefined)
+    const dismissed = visibility.settings(view, { ...emptySnapshot(), mode: "shared" })
+    const frame = await ui.waitForFrame((frame) => frame.includes("Browser settings"))
+    const lines = frame.split("\n")
+    const y = lines.findIndex((line) => line.includes("esc"))
+    await ui.mockMouse.click(lines[y].indexOf("esc") + 1, y)
+    await dismissed
+    assert.equal(dialog(), undefined)
+    assert.equal(visibility.busy(), false)
+    assert.equal(calls, 1, "dismissal must not change settings")
     const cancelled = visibility.settings(view, { ...emptySnapshot(), mode: "shared" })
     await ui.waitForFrame((frame) => frame.includes("Browser settings"))
     controller.abort()

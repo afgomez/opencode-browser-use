@@ -45,7 +45,9 @@ export function SettingsDialog(props: { snapshot: PagesSnapshot; choose: (choice
   return <box flexDirection="column" paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1}>
     <box flexDirection="row" justifyContent="space-between">
       <text fg={context.theme.text.base}><strong>Browser settings</strong></text>
-      <text fg={context.theme.text.muted}>esc</text>
+      <box onMouseUp={(event) => { if (event.button === 0) { event.stopPropagation(); context.ui.dialog.clear() } }}>
+        <text fg={context.theme.text.muted}>esc</text>
+      </box>
     </box>
     <box flexDirection="column">
       <text fg={context.theme.text.muted}>The settings affect the <strong>current session</strong> only.</text>
