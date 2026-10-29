@@ -3,6 +3,7 @@ import { loadCatalog } from "./mcp"
 import { sharedManager } from "./manager"
 import { options } from "./options"
 import { permissionFor, wrappedCatalog } from "./policy"
+import { BrowserUse } from "./rpc"
 
 const object = (properties: Record<string, unknown> = {}, required: string[] = []) => ({
   type: "object" as const, properties, required, additionalProperties: false,
@@ -29,6 +30,24 @@ export default Plugin.define({
     const detach = manager.attach()
     const events = new AbortController()
     try {
+      await ctx.rpc.register(BrowserUse, {
+        pages: async (input, context) => {
+          const { sessionID } = input as { sessionID: string }
+          return manager.inspectPages(sessionID, context.signal)
+        },
+        switchMode: async (input, context) => {
+          const { sessionID, mode } = input as { sessionID: string; mode: string }
+          try {
+            context.signal.throwIfAborted()
+            // Trusted client control: the UI obtains human confirmation. Agent
+            // permission rules (including deny) apply only to the tool path below.
+            await manager.execute("switch_mode", { mode }, { sessionID, directory: ctx.location.directory, signal: context.signal })
+            return {}
+          } catch (error) {
+            return context.error("switch_failed", error instanceof Error ? error.message : "Browser mode switch was not completed", {})
+          }
+        },
+      })
       await ctx.tool.transform((editor) => {
         editor.namespace({ name: "browser_use", description: "Session-owned Chrome tabs with persistent shared authentication. Headless by default. Explicit page handles are mandatory; use login_start/login_finish for human login. Separate from OpenCode's built-in desktop browser." })
         for (const tool of [...controls, ...catalog.map((tool) => ({ ...tool, input: tool.inputSchema }))]) {

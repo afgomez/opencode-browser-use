@@ -4,12 +4,21 @@
   "private": true,
   "description": "Session-owned persistent Chrome automation for OpenCode V2",
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
-  "files": ["index.ts", "src", "README.md"],
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx",
+    "./rpc": "./src/rpc.ts"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "test": "tsx --test test/*.test.ts",
     "test:integration": "tsx --test test/integration.ts",
     "test:opencode": "tsx --test test/opencode.ts",
+    "test:tui": "bun test --preload @opentui/solid/preload test/tui.test.tsx",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -18,9 +27,24 @@
     "chrome-devtools-mcp": "1.12.0",
     "proper-lockfile": "4.1.2"
   },
+  "peerDependencies": {
+    "@opentui/core": ">=0.7.0",
+    "@opentui/solid": ">=0.7.0",
+    "solid-js": ">=1.9.0"
+  },
+  "overrides": {
+    "solid-js": {
+      "seroval": "1.6.11"
+    }
+  },
   "devDependencies": {
+    "@opencode/client": "2.2.0",
+    "@opencode/theme": "2.2.0",
+    "@opentui/core": "0.7.0",
+    "@opentui/solid": "0.7.0",
     "@types/node": "26.0.0",
     "@types/proper-lockfile": "4.1.4",
+    "solid-js": "1.9.12",
     "tsx": "4.21.0",
     "typescript": "5.9.3"
   }

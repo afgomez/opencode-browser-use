@@ -3,28 +3,56 @@ export class Cdp {
   private next = 0
   private pending = new Map<number, { resolve(value: any): void; reject(error: Error): void; timer: NodeJS.Timeout }>()
   private constructor(private socket: WebSocket) {
+    Cdp.listen(this, socket)
+  }
+
+  private static listen(client: Cdp, socket: WebSocket) {
     socket.addEventListener("message", (event) => {
+      if (client.socket !== socket) return
       const message = JSON.parse(String(event.data))
-      const request = this.pending.get(message.id)
+      const request = client.pending.get(message.id)
       if (!request) return
-      this.pending.delete(message.id)
+      client.pending.delete(message.id)
       clearTimeout(request.timer)
       if (message.error) request.reject(new Error(message.error.message))
       else request.resolve(message.result)
     })
-    socket.addEventListener("close", () => this.rejectPending())
-    socket.addEventListener("error", () => this.rejectPending())
+    socket.addEventListener("close", () => { if (client.socket === socket) client.rejectPending() })
+    socket.addEventListener("error", () => { if (client.socket === socket) client.rejectPending() })
   }
 
   static async connect(url: string): Promise<Cdp> {
     const socket = new WebSocket(url)
     const client = new Cdp(socket)
+    await Cdp.ready(socket)
+    return client
+  }
+
+  private static async ready(socket: WebSocket) {
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => { socket.close(); reject(new Error("Chrome CDP connection timed out")) }, 10_000)
       socket.addEventListener("open", () => { clearTimeout(timer); resolve() }, { once: true })
       socket.addEventListener("error", () => { clearTimeout(timer); reject(new Error("Chrome CDP connection failed")) }, { once: true })
     })
-    return client
+  }
+
+  static disconnected(client: Cdp) {
+    return !!client.socket && client.socket.readyState !== WebSocket.OPEN
+  }
+
+  /** Reattach to the exact same Chrome endpoint, preserving live process/tab identity.
+   * Static so compatible plugin reloads can also repair older live Cdp instances.
+   * Never replay a command here: callers may retry only read-only metadata.
+   */
+  static async reconnect(client: Cdp) {
+    if (!Cdp.disconnected(client)) return
+    const previous = client.socket
+    const socket = new WebSocket(previous.url)
+    client.rejectPending()
+    previous.close()
+    client.socket = socket
+    Cdp.listen(client, socket)
+    await Cdp.ready(socket)
   }
 
   async send<T = any>(method: string, params: Record<string, unknown> = {}): Promise<T> {

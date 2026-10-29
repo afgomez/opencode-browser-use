@@ -8,6 +8,8 @@ import { join } from "node:path"
 import { test } from "node:test"
 import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
+import { OpenCode } from "@opencode/client"
+import { BrowserUse, emptySnapshot } from "../src/rpc"
 
 test("the real OpenCode V2 server loads the explicitly configured local plugin as active", { timeout: 60_000 }, async () => {
   const base = join(tmpdir(), "opencode")
@@ -58,6 +60,7 @@ test("the real OpenCode V2 server loads the explicitly configured local plugin a
     }
     assert.ok(loaded, `Plugin did not load. Server output:\n${log}`)
     assert.equal(loaded.state.status, "active", JSON.stringify(loaded))
+    assert.equal(loaded.features.tui, true, "the real server must advertise the TUI entrypoint to clients")
     const response = await fetch(`http://127.0.0.1:${port}/api/agent?location[directory]=${encodeURIComponent(project)}`, { headers })
     assert.ok(response.ok)
     const agents = await response.json() as any
@@ -67,6 +70,20 @@ test("the real OpenCode V2 server loads the explicitly configured local plugin a
       { action: "browser_use", resource: "login_start", effect: "ask" },
       { action: "browser_use", resource: "switch_mode.headed", effect: "ask" },
     ])
+    const browser = OpenCode.make({ baseUrl: `http://127.0.0.1:${port}`, headers }).rpc(BrowserUse)
+    const request = { location: { directory: project } }
+    assert.deepEqual(await browser.pages({ sessionID: "sidebar-test" }, request), emptySnapshot())
+    for (const input of [{}, { sessionID: "" }, { sessionID: 1 }]) {
+      await assert.rejects(browser.pages(input, request), { type: "rpc.invalid_input" })
+    }
+    await assert.rejects(browser.switchMode({ sessionID: "sidebar-test", mode: "visible" }, request), { type: "rpc.invalid_input" })
+    const client = OpenCode.make({ baseUrl: `http://127.0.0.1:${port}`, headers })
+    const session = await client.session.create({ location: { directory: project }, title: "Sidebar mode permissions" })
+    await client.session.update({ sessionID: session.id, permissions: [{ action: "browser_use", resource: "switch_mode.*", effect: "deny" }] })
+    assert.deepEqual(await browser.switchMode({ sessionID: session.id, mode: "headless" }, request), {}, "direct user control must ignore agent deny rules")
+    await client.session.update({ sessionID: session.id, permissions: [{ action: "browser_use", resource: "switch_mode.*", effect: "allow" }] })
+    assert.deepEqual(await browser.switchMode({ sessionID: session.id, mode: "headless" }, request), {})
+    assert.deepEqual(await browser.pages({ sessionID: session.id }, request), emptySnapshot())
   } finally {
     const exited = once(child, "exit")
     child.kill("SIGTERM")

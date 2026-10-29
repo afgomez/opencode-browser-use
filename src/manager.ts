@@ -6,6 +6,8 @@ import { connectMcp, type Mcp } from "./mcp"
 import type { Options } from "./options"
 import { browserMode, data, filteredResult, pageTools, type BrowserMode, type PublicPage } from "./policy"
 import { Serial } from "./serial"
+import type { PagesSnapshot } from "./rpc"
+import { Cdp } from "./cdp"
 
 export interface Caller { sessionID: string; directory: string; signal?: AbortSignal }
 interface Page extends PublicPage { sessionID: string; tabId: string; upstreamId: number }
@@ -172,6 +174,43 @@ export class BrowserManager {
 
   private publicPages(sessionID: string): PublicPage[] {
     return [...this.pages.values()].filter((page) => page.sessionID === sessionID).map(pageView)
+  }
+
+  /** Passive UI inspection: never launch/restart Chrome, touch leases, or select a page. */
+  async inspectPages(sessionID: string, signal?: AbortSignal): Promise<PagesSnapshot> {
+    if (!sessionID) throw new Error("Browser inspection requires a session ID")
+    return this.serial.run(async () => {
+      this.assertActive()
+      const state = { mode: this.mode, paused: !!this.login || !!this.restoration }
+      if (!this.browser?.alive()) return { ...state, pages: [] }
+      const owned = [...this.pages.values()].filter((page) => page.sessionID === sessionID)
+      if (!owned.length) return { ...state, pages: [] }
+      // Browser-level metadata also catches human navigation/title changes and
+      // tab closure during login. No page scripts or paused automation are run.
+      // get_tab_id identifies the tab target, not its inner page target. Chrome
+      // excludes tab targets by default, so request them explicitly.
+      const browser = this.browser
+      const read = () => browser.cdp.send<{
+        targetInfos: Array<{ targetId: string; type: string; title: string; url: string }>
+      }>("Target.getTargets", { filter: [{ type: "tab" }] })
+      let result: Awaited<ReturnType<typeof read>>
+      try { result = await read() } catch (error) {
+        // Repair only the existing metadata transport while exclusive profile
+        // ownership is still valid. Never launch Chrome or retry a page action.
+        if (!browser.alive() || !Cdp.disconnected(browser.cdp)) throw error
+        await Cdp.reconnect(browser.cdp)
+        result = await read()
+      }
+      const { targetInfos } = result
+      const targets = new Map(targetInfos.filter((target) => target.type === "tab").map((target) => [target.targetId, target]))
+      const pages: PublicPage[] = []
+      for (const page of owned) {
+        const target = targets.get(page.tabId)
+        if (!target) continue
+        pages.push({ pageId: page.pageId, title: target.title, url: target.url })
+      }
+      return { ...state, pages }
+    }, signal)
   }
 
   private status(sessionID: string) {

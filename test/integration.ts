@@ -7,11 +7,12 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 import { BrowserManager } from "../src/manager"
-import { Chrome } from "../src/chrome"
+import { Chrome, type BrowserProcess } from "../src/chrome"
 import { Cdp } from "../src/cdp"
 import { loadCatalog } from "../src/mcp"
 import { options } from "../src/options"
 import { wrappedCatalog } from "../src/policy"
+import { emptySnapshot } from "../src/rpc"
 
 test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, restarts, locks, cleanup", { timeout: 180_000 }, async () => {
   const base = join(tmpdir(), "opencode")
@@ -22,8 +23,9 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
   // Exercise mode switching and the complete login protocol without opening a window or stealing
   // focus during automated tests. Actual headed UI is a separate manual check.
   const requestedModes: boolean[] = []
+  let browser!: BrowserProcess
   const manager = new BrowserManager(config, { chrome: {
-    start: (headless) => { requestedModes.push(headless); return chrome.start(true) }, stop: (release) => chrome.stop(release),
+    start: async (headless) => { requestedModes.push(headless); return browser = await chrome.start(true) }, stop: (release) => chrome.stop(release),
   } })
   const server = createServer((request, response) => {
     if (request.url === "/set-cookie") response.setHeader("Set-Cookie", "browser_use_test=authenticated; Max-Age=3600; Path=/; SameSite=Lax")
@@ -37,6 +39,8 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
   const b = { sessionID: "integration-b", directory }
   const parse = (result: any) => JSON.parse(typeof result.content === "string" ? result.content : result.content[0].text)
   try {
+    assert.deepEqual(await manager.inspectPages(a.sessionID), emptySnapshot())
+    assert.deepEqual(requestedModes, [])
     const catalog = wrappedCatalog(await loadCatalog(config.nodePath))
     assert.ok(catalog.some((tool) => tool.name === "take_snapshot"))
     assert.equal(catalog.length, 21)
@@ -48,6 +52,19 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
     const pageB = parse(openedB).pages[0].pageId
     assert.equal(typeof pageA, "string")
     assert.ok(!JSON.stringify(openedA).includes("b-private"))
+    assert.deepEqual(await manager.inspectPages(a.sessionID), {
+      ...emptySnapshot(),
+      pages: [{ pageId: pageA, title: "/set-cookie", url: `${origin}/set-cookie` }],
+    })
+    assert.deepEqual(await manager.inspectPages("unowned-session"), emptySnapshot())
+    browser.cdp.close()
+    assert.equal(Cdp.disconnected(browser.cdp), true)
+    assert.deepEqual(await manager.inspectPages(a.sessionID), {
+      ...emptySnapshot(), pages: [{ pageId: pageA, title: "/set-cookie", url: `${origin}/set-cookie` }],
+    })
+    assert.equal(Cdp.disconnected(browser.cdp), false)
+    assert.deepEqual(requestedModes, [true], "repairing metadata must not restart Chrome")
+    assert.equal((await manager.inspectPages(b.sessionID)).pages[0].pageId, pageB)
     await assert.rejects(manager.execute("take_snapshot", { pageId: pageA }, b), /foreign page handle/)
     const snapshot = await manager.execute("take_snapshot", { pageId: pageA }, a)
     assert.match(JSON.stringify(snapshot), /set-cookie/)
@@ -72,6 +89,8 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
     assert.deepEqual(requestedModes, [true, false, true])
     assert.equal(parse(await manager.execute("list_pages", {}, a)).pages[0].pageId, pageA)
     await manager.execute("login_start", { pageId: pageA }, a)
+    assert.equal((await manager.inspectPages(a.sessionID)).pages[0].pageId, pageA)
+    assert.equal(parse(await manager.execute("status", {}, a)).paused, true)
     await assert.rejects(manager.execute("take_snapshot", { pageId: pageB }, b), /paused/)
     await assert.rejects(manager.execute("switch_mode", { mode: "headless" }, b), /paused for human login/)
     await manager.execute("login_finish", {}, a)
@@ -81,9 +100,11 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
     assert.equal(listedB.pages[0].pageId, pageB)
     assert.equal(listedB.pages[0].url, `${origin}/b-private`)
     await manager.execute("release", {}, a)
+    assert.deepEqual(await manager.inspectPages(a.sessionID), emptySnapshot())
     assert.equal(parse(await manager.execute("status", {}, b)).running, true)
     assert.equal(parse(await manager.execute("list_pages", {}, b)).pages.length, 1)
     await manager.execute("close_page", { pageId: pageB }, b)
+    assert.deepEqual(await manager.inspectPages(b.sessionID), emptySnapshot())
     assert.equal(parse(await manager.execute("list_pages", {}, b)).pages.length, 0)
   } finally {
     await manager.dispose()

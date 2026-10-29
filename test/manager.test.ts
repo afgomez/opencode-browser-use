@@ -6,6 +6,7 @@ import { options } from "../src/options"
 import { filteredResult, pageTools, permissionFor, wrappedCatalog } from "../src/policy"
 import type { Mcp } from "../src/mcp"
 import type { BrowserProcess } from "../src/chrome"
+import { emptySnapshot } from "../src/rpc"
 
 const config = () => options({ profileDirectory: "/test/browser", idleTimeoutMs: 100, leaseTimeoutMs: 1000, loginTimeoutMs: 500, unloadGraceMs: 200 })
 const caller = (sessionID: string, signal?: AbortSignal) => ({ sessionID, directory: "/workspace", signal })
@@ -22,13 +23,18 @@ function fixture() {
   let failNext = false
   let failLaunch = false
   let failNavigationFor: string | undefined
+  let failCdp = false
   let blocked: Promise<void> | undefined
   let releaseBlock: (() => void) | undefined
   let enteredBlock: (() => void) | undefined
   const modes: boolean[] = []
   const calls: Array<{ name: string; args: Record<string, unknown> }> = []
+  const cdpCalls: string[] = []
   const tabs = new Map<string, { id: number; url: string; title: string }>()
   const cdp = { async send(name: string, args: Record<string, unknown>) {
+    cdpCalls.push(name)
+    if (failCdp) { failCdp = false; throw new Error("Chrome disconnected") }
+    if (name === "Target.getTargets") return { targetInfos: [...tabs].map(([targetId, tab]) => ({ targetId, type: "tab", title: tab.title, url: tab.url })) }
     if (name === "Target.closeTarget") tabs.delete(args.targetId as string)
     return { success: true }
   } }
@@ -82,11 +88,12 @@ function fixture() {
     return result.pages.at(-1).pageId as string
   }
   return {
-    manager, open, calls, tabs, modes, connect,
+    manager, open, calls, cdpCalls, tabs, modes, connect,
     advance(ms: number) { now += ms },
     fail() { failNext = true },
     failLaunch() { failLaunch = true },
     failNavigation(url: string) { failNavigationFor = url },
+    failCdp() { failCdp = true },
     crash() { running = false },
     block() {
       blocked = new Promise<void>((resolve) => { releaseBlock = resolve })
@@ -126,6 +133,106 @@ test("every page operation rejects foreign, numeric, and invented handles", asyn
   await assert.rejects(f.manager.execute("evaluate_script", { pageId: a, serviceWorkerId: "sw-1" }, caller("a")), /Service-worker/)
   await assert.rejects(f.manager.execute("select_page", { pageId: a, bringToFront: true }, caller("a")), /explicit headed handoff/)
   await f.manager.dispose()
+})
+
+test("sidebar inspection is lazy and never creates a lease or launches Chrome", async () => {
+  const f = fixture()
+  try {
+    assert.deepEqual(await f.manager.inspectPages("a"), emptySnapshot())
+    assert.deepEqual(f.modes, [])
+    assert.deepEqual(f.cdpCalls, [])
+    assert.deepEqual(f.calls, [])
+    assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).activeLeases, 0)
+    await assert.rejects(f.manager.inspectPages(""), /session ID/)
+  } finally { await f.manager.dispose() }
+})
+
+test("sidebar inspection uses live metadata but exposes only the requested session's owned handles", async () => {
+  const f = fixture()
+  try {
+    const a = await f.open("a")
+    await f.open("b", "https://b-private.test/")
+    const tab = [...f.tabs].find(([, tab]) => tab.url === "https://a.test/")!
+    tab[1].title = "New page title"
+    tab[1].url = "https://a.test/changed-by-human"
+    f.tabs.set("popup", { id: 99, title: "Unknown popup", url: "https://popup-private.test/" })
+    const before = f.calls.length
+    assert.deepEqual(await f.manager.inspectPages("a"), {
+      ...emptySnapshot(),
+      pages: [{ pageId: a, title: "New page title", url: "https://a.test/changed-by-human" }],
+    })
+    assert.equal(f.calls.length, before, "inspection must not call MCP or change its selected page")
+    assert.deepEqual(f.cdpCalls, ["Target.getTargets"])
+    assert.deepEqual(await f.manager.inspectPages("unknown"), emptySnapshot())
+    f.tabs.delete(tab[0])
+    assert.deepEqual(await f.manager.inspectPages("a"), emptySnapshot())
+  } finally { await f.manager.dispose() }
+})
+
+test("sidebar polling cannot keep leases or an idle browser alive", async () => {
+  const f = fixture()
+  try {
+    await f.open("a")
+    for (let i = 0; i < 4; i++) { f.advance(300); await f.manager.inspectPages("a") }
+    await f.manager.sweep()
+    assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).leaseHeld, false)
+    assert.deepEqual(await f.manager.inspectPages("a"), emptySnapshot())
+    f.advance(101)
+    await f.manager.inspectPages("a")
+    await f.manager.sweep()
+    assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).running, false)
+    assert.deepEqual(f.modes, [true])
+  } finally { await f.manager.dispose() }
+})
+
+test("sidebar reads remain passive during login, crash, release, and failed restoration", async () => {
+  const f = fixture()
+  try {
+    const a = await f.open("a")
+    await f.manager.execute("login_start", { pageId: a }, caller("a"))
+    assert.equal((await f.manager.inspectPages("a")).pages[0].pageId, a)
+    assert.equal((await f.manager.inspectPages("a")).mode, "headed")
+    assert.equal((await f.manager.inspectPages("a")).paused, true)
+    assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).paused, true)
+    await assert.rejects(f.manager.execute("take_snapshot", { pageId: a }, caller("a")), /paused/)
+    await f.manager.execute("login_finish", {}, caller("a"))
+    f.failLaunch()
+    await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /launch failed/)
+    assert.deepEqual(await f.manager.inspectPages("a"), { ...emptySnapshot(), paused: true })
+    await f.manager.execute("switch_mode", { mode: "headless" }, caller("a"))
+    assert.equal((await f.manager.inspectPages("a")).pages[0].pageId, a)
+    await f.manager.release("a")
+    assert.deepEqual(await f.manager.inspectPages("a"), emptySnapshot())
+    await f.open("a")
+    f.crash()
+    const before = f.modes.length
+    assert.deepEqual(await f.manager.inspectPages("a"), emptySnapshot())
+    assert.equal(f.modes.length, before)
+  } finally { await f.manager.dispose() }
+})
+
+test("sidebar reads serialize with operations and queued cancellation has no browser side effects", async () => {
+  const f = fixture()
+  try {
+    const a = await f.open("a")
+    const entered = f.block()
+    const operation = f.manager.execute("evaluate_script", { pageId: a }, caller("a"))
+    await entered
+    const controller = new AbortController()
+    const cancelled = f.manager.inspectPages("a", controller.signal)
+    const inspection = f.manager.inspectPages("a")
+    assert.deepEqual(f.cdpCalls, [])
+    controller.abort()
+    f.unblock()
+    await operation
+    await assert.rejects(cancelled, /abort/i)
+    assert.equal((await inspection).pages[0].pageId, a)
+    assert.deepEqual(f.cdpCalls, ["Target.getTargets"])
+    f.failCdp()
+    await assert.rejects(f.manager.inspectPages("a"), /disconnected/)
+    assert.equal((await f.manager.inspectPages("a")).pages[0].pageId, a)
+    assert.deepEqual(f.modes, [true])
+  } finally { f.unblock(); await f.manager.dispose() }
 })
 
 test("reads return scoped structured content, not global MCP text or page inventories", async () => {

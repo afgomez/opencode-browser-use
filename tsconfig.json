@@ -6,8 +6,10 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
     "types": ["node"],
     "lib": ["ES2023", "DOM"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "test/**/*.tsx"]
 }

@@ -56,6 +56,56 @@ tools are deliberately not exposed. Newly added upstream tools are not
 automatically exposed. Human-created and popup tabs are **not adopted**; a
 human can still use popups during the login handoff.
 
+## Sidebar
+
+The terminal UI adds a **Browser use** section to the session sidebar while that
+session owns open tabs. Each entry shows its title and a muted URL, truncated to
+the available width. Pages without a title show **Untitled**. The section hides
+when there are no tabs and follows the viewed session, not the entire browser
+or its parent/subagent sessions.
+
+On the title row, a **Headless** (or **Headed**) button shows the shared browser
+mode with a dropdown arrow (**Headless ▾**). It has horizontal padding, the theme's primary-action
+filled/focused background and matching text color (the normal action background
+can be transparent), a bold label, and themed hover/disabled
+states. It stays on the same line
+in narrow sidebars by truncating the title if needed. Tab entries remain indented.
+Clicking the button opens OpenCode's native selection dialog
+with **Headless** and **Headed**, initially selecting the current mode. Cancelling
+or choosing the current mode does nothing. Choosing the other mode opens a
+confirmation warning that every session's tabs
+will reload and unsaved page state/snapshots will be lost. That
+confirmation is the user's authorization: sidebar actions do not evaluate agent
+permission rules, including `ask` or `deny`. Agent browser tools still enforce
+those rules unchanged. Choosing the active mode is a no-op. Controls show
+only an animated spinner in place of the mode button while applying a confirmed change, not while the
+picker or confirmation is open, and are disabled during a login/recovery pause. Failed
+switches show an error toast rather than optimistically changing the highlight.
+
+The list and mode refresh about once per second while mounted, including human title,
+navigation, and close changes during headed inspection or login. Reads share
+the browser operation queue, so a long-running tool can delay an update. Failed
+reads clear stale entries, show **Browser connection unavailable; retrying…**,
+and retry on the next poll. Switching sessions or
+unmounting cancels the old reader and discards late responses.
+
+Tab entries remain read-only: no links, focus switches, or close controls. Inspection never
+starts/restarts Chrome, renews a session lease, or adopts unknown tabs. It reads
+only target metadata over the private connection; login remains paused. If the
+metadata socket disconnects while Chrome is still owned and alive, inspection
+reattaches to the exact same endpoint and retries that read once, without
+reloading tabs or replaying browser actions.
+The TUI part loads automatically with the existing plugin registration, with no
+additional permission rules. Other clients can import the `./rpc` contract and
+call `pages({ sessionID })` at the session's location; it returns the shared
+`mode` and `paused` state alongside only that session's owned `pageId`, `title`,
+and `url` fields. `switchMode({ sessionID, mode })` is a trusted-client control:
+it bypasses agent permission rules and relies on the UI's confirmation, while
+using the same serialized lifecycle and login-pause restrictions as the browser
+tools. The RPC itself does not prove a human confirmed; it is not an agent tool
+or a security boundary against untrusted clients. Session IDs for this UI API come from the
+client, never from model-supplied browser-tool inputs.
+
 ## Headed inspection
 
 ```js
@@ -208,6 +258,7 @@ npm run typecheck
 npm test
 npm run test:integration
 npm run test:opencode
+npm run test:tui
 ```
 
 Integration tests use disposable profiles, a local HTTP server, and regular
@@ -215,3 +266,9 @@ Chrome. They verify cookie persistence, scope, stable handles, profile contentio
 and abrupt-process recovery. Their mode/login transitions are deliberately forced
 headless to avoid stealing focus. Visible inspection and third-party AuthKit
 login remain manual checks; the tests do not authenticate to any real account.
+
+TUI rendering tests require Bun and use the OpenTUI test renderer (no interactive
+terminal needed). The OpenTUI/Solid development versions match the plugin SDK's
+peers; `seroval` is overridden to a patched version because that Solid release
+otherwise pins an older vulnerable serializer. OpenCode supplies the actual
+TUI runtime when loading the plugin.
