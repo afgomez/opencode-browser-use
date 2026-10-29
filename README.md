@@ -33,6 +33,8 @@ Tools use the `browser_use` namespace (effective names such as
 `browser_use_new_page`), avoiding collisions with OpenCode's built-in desktop
 browser tools.
 In Code Mode, use the tool names reported by OpenCode's tool catalog.
+Browser guidance lives in the namespace and tool descriptions; the plugin does
+not inject a separate instruction paragraph into session context.
 
 1. `new_page({url})` creates a background tab and returns a session-owned
    **string** `pageId` handle.
@@ -65,24 +67,24 @@ when there are no tabs and follows the viewed session, not the entire browser
 or its parent/subagent sessions.
 
 On the title row, a **Headless** (or **Headed**) button shows the shared browser
-mode with a dropdown arrow (**Headless ▾**). It has horizontal padding, the theme's primary-action
+visibility with a dropdown arrow (**Headless ▾**). It has horizontal padding, the theme's primary-action
 filled/focused background and matching text color (the normal action background
 can be transparent), a bold label, and themed hover/disabled
 states. It stays on the same line
 in narrow sidebars by truncating the title if needed. Tab entries remain indented.
 Clicking the button opens OpenCode's native selection dialog
-with **Headless** and **Headed**, initially selecting the current mode. Cancelling
-or choosing the current mode does nothing. Choosing the other mode opens a
+with **Headless** and **Headed**, initially selecting the current visibility. Cancelling
+or choosing the current visibility does nothing. Choosing a different value opens a
 confirmation warning that every session's tabs
 will reload and unsaved page state/snapshots will be lost. That
 confirmation is the user's authorization: sidebar actions do not evaluate agent
 permission rules, including `ask` or `deny`. Agent browser tools still enforce
-those rules unchanged. Choosing the active mode is a no-op. Controls show
-only an animated spinner in place of the mode button while applying a confirmed change, not while the
+those rules unchanged. Choosing the current visibility is a no-op. Controls show
+only an animated spinner in place of the visibility button while applying a confirmed change, not while the
 picker or confirmation is open, and are disabled during a login/recovery pause. Failed
 switches show an error toast rather than optimistically changing the highlight.
 
-The list and mode refresh about once per second while mounted, including human title,
+The list and visibility refresh about once per second while mounted, including human title,
 navigation, and close changes during headed inspection or login. Reads share
 the browser operation queue, so a long-running tool can delay an update. Failed
 reads clear stale entries, show **Browser connection unavailable; retrying…**,
@@ -98,39 +100,54 @@ reloading tabs or replaying browser actions.
 The TUI part loads automatically with the existing plugin registration, with no
 additional permission rules. Other clients can import the `./rpc` contract and
 call `pages({ sessionID })` at the session's location; it returns the shared
-`mode` and `paused` state alongside only that session's owned `pageId`, `title`,
-and `url` fields. `switchMode({ sessionID, mode })` is a trusted-client control:
+`visibility` and `paused` state alongside only that session's owned `pageId`, `title`,
+and `url` fields. `setVisibility({ sessionID, visibility })` is a trusted-client control:
 it bypasses agent permission rules and relies on the UI's confirmation, while
 using the same serialized lifecycle and login-pause restrictions as the browser
 tools. The RPC itself does not prove a human confirmed; it is not an agent tool
 or a security boundary against untrusted clients. Session IDs for this UI API come from the
 client, never from model-supplied browser-tool inputs.
 
+The browser state uses `visibility` consistently in RPC responses and `status`.
+Hot reload migrates the legacy in-memory field without restarting Chrome or
+discarding handles; clients should use the current `setVisibility` contract.
+
 ## Headed inspection
 
-```js
-switch_mode({ mode: "headed" })
-switch_mode({ mode: "headless" })
+Visibility is a user control, not an agent tool. Use the sidebar button or the
+local TUI command in an open session:
+
+```text
+/browser-use visibility headed
+/browser-use visibility headless
+/browser-use visibility
 ```
 
-`switch_mode` changes visibility without pausing automation: you can watch the
-agent work in headed mode. The change applies to the one shared Chrome process,
+Omit the visibility value to open the same picker as the sidebar. Invalid arguments show
+usage rather than sending a prompt to the agent. The command works with the
+sidebar hidden and before any tabs are opened. Actual changes require the same
+confirmation as the sidebar, bypass agent permission rules, and share its busy
+state/spinner. Choosing the current visibility is a no-op.
+
+Changing visibility does not pause automation: you can watch the
+agent work in a visible window. The change applies to the one shared Chrome process,
 so every session's owned tabs are reloaded. HTTP(S) URLs, persistent cookies, and
 page handles survive; unsaved page state, navigation history, and snapshot UIDs
 do not. Always take fresh snapshots afterward. The calling session's first owned
-tab is activated when switching to headed mode; other sessions' tabs are never
+tab is activated when switching to headed visibility; other sessions' tabs are never
 selected for it.
 
-Requesting the already-selected mode is a no-op and does not restart Chrome.
+Requesting the already-selected visibility is a no-op and does not restart Chrome.
 Requesting headless before Chrome has started does not start it. Switching to
 headed can start Chrome without first launching it headless. `status` reports
-`mode` (`headed` or `headless`) separately from `paused`.
+`visibility` (`headed` or `headless`) separately from `paused`.
 
-Mode switches drain the shared operation queue before restarting. A failed
-restart pauses automation rather than exposing partly restored state; retry
-`switch_mode` to recover. A mode switch cannot bypass an active human-login
+Visibility changes drain the shared operation queue before restarting. A failed
+restart pauses automation rather than exposing partly restored state; retry an
+explicit `/browser-use visibility headless` or `headed` command to recover,
+even if the requested visibility is already selected. A visibility change cannot bypass an active human-login
 pause. Use `login_start` / `login_finish` when the agent must stop interacting
-while you sign in. Login completion still returns Chrome to headless mode.
+while you sign in. Login completion still returns Chrome to headless visibility.
 Idle shutdown resets the default to headless for the next browser launch.
 
 ## Human login
@@ -156,13 +173,12 @@ does not extend that deadline. Only the initiating session can finish it early.
 A failed restart stays paused and can be retried with `login_finish`.
 
 Tools check the `browser_use` permission action with their operation name as
-the resource, except `switch_mode`, which uses `switch_mode.headed` or
-`switch_mode.headless`. The global configuration allows routine operations but asks for
+the resource. The global configuration allows routine operations but asks for
 `login_start` because it begins a disruptive shared-profile handoff. `login_finish`
 needs no additional permission prompt, but the agent must still wait for the
-human to confirm they are done. It also asks for `switch_mode.headed`, because
-opening a visible browser can steal focus and reloads all sessions' tabs.
-Returning to headless does not require an extra prompt. Keep these exceptions
+human to confirm they are done. Visibility is controlled only by the user through
+the sidebar or command, not an agent tool or permission rule. Old
+`switch_mode.*` permission rules are no longer needed. Keep the login exception
 unless you explicitly want unattended transitions. Specific rules must follow
 the broad `*` rule because the last matching rule wins.
 
@@ -215,8 +231,7 @@ To override defaults, configure this same plugin directory using the object form
   }],
   "permissions": [
     { "action": "browser_use", "resource": "*", "effect": "allow" },
-    { "action": "browser_use", "resource": "login_start", "effect": "ask" },
-    { "action": "browser_use", "resource": "switch_mode.headed", "effect": "ask" }
+    { "action": "browser_use", "resource": "login_start", "effect": "ask" }
   ]
 }
 ```
@@ -263,7 +278,7 @@ npm run test:tui
 
 Integration tests use disposable profiles, a local HTTP server, and regular
 Chrome. They verify cookie persistence, scope, stable handles, profile contention,
-and abrupt-process recovery. Their mode/login transitions are deliberately forced
+and abrupt-process recovery. Their visibility/login transitions are deliberately forced
 headless to avoid stealing focus. Visible inspection and third-party AuthKit
 login remain manual checks; the tests do not authenticate to any real account.
 

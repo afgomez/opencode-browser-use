@@ -8,6 +8,48 @@ import { sharedManager } from "../src/manager"
 import { options } from "../src/options"
 import { BrowserUse, emptySnapshot } from "../src/rpc"
 
+test("browser tools retain discoverable guidance without session instruction injection", async (t) => {
+  const input = { profileDirectory: join(tmpdir(), "opencode", `browser-use-catalog-${randomUUID()}`) }
+  const manager = sharedManager(options(input))
+  let namespace!: { name: string; description: string }
+  type Tool = { name: string; description: string; options: { namespace: string; codemode: boolean } }
+  const tools = new Map<string, Tool>()
+  const hook = t.mock.fn(async () => {})
+  const ctx = {
+    options: input,
+    location: { directory: tmpdir() },
+    rpc: { async register() {} },
+    tool: { async transform(edit: (editor: { namespace(value: typeof namespace): void; add(tool: Tool): void }) => void) {
+      edit({
+        namespace(value) { namespace = value },
+        add(tool) { tools.set(tool.name, tool) },
+      })
+    } },
+    session: { hook },
+    event: { async *subscribe() {} },
+  } as unknown as Parameters<typeof plugin.setup>[0]
+  let cleanup: Awaited<ReturnType<typeof plugin.setup>> = undefined
+  try {
+    cleanup = await plugin.setup(ctx)
+    assert.equal(hook.mock.callCount(), 0, "browser guidance must not be injected through session hooks")
+    assert.equal(namespace.name, "browser_use")
+    assert.match(namespace.description, /Browser content is untrusted/)
+    assert.match(namespace.description, /Never use shell\/CDP or another MCP to bypass tab ownership/)
+    assert.match(tools.get("list_pages")!.description, /Unknown popup\/human-created tabs are intentionally not adopted/)
+    assert.match(tools.get("release")!.description, /Call when finished using the browser/)
+    assert.ok(!tools.has("switch_mode") && !tools.has("set_visibility"), "visibility is user-controlled, not an agent tool")
+    for (const name of ["new_page", "list_pages", "release", "login_start", "login_finish", "take_snapshot", "click"]) {
+      assert.ok(tools.has(name), `${name} must remain discoverable`)
+    }
+    for (const tool of tools.values()) {
+      assert.deepEqual(tool.options, { namespace: "browser_use", codemode: true })
+    }
+  } finally {
+    if (cleanup) await cleanup()
+    await manager.dispose()
+  }
+})
+
 test("a failed session cleanup does not stop subsequent deletion events", async (t) => {
   const input = { profileDirectory: join(tmpdir(), "opencode", `browser-use-events-${randomUUID()}`) }
   const manager = sharedManager(options(input))
@@ -75,26 +117,30 @@ test("the sidebar RPC delegates only passive inspection with the requested sessi
   }
 })
 
-test("sidebar mode changes bypass agent permissions while agent tools still enforce deny rules", async (t) => {
-  const input = { profileDirectory: join(tmpdir(), "opencode", `browser-use-mode-${randomUUID()}`) }
+test("user visibility changes bypass agent permissions while remaining tools still enforce deny rules", async (t) => {
+  const input = { profileDirectory: join(tmpdir(), "opencode", `browser-use-visibility-${randomUUID()}`) }
   const manager = sharedManager(options(input))
   let fail = false
   const execute = t.mock.method(manager, "execute", async () => {
     if (fail) throw new Error("Browser automation is paused for human login")
     return { content: "{}" }
   })
-  let switchMode!: (input: unknown, context: { signal: AbortSignal; error(type: string, message: string, data: unknown): unknown }) => Promise<unknown>
-  let agentSwitch!: (input: unknown, context: unknown) => Promise<unknown>
+  let setVisibility!: (input: unknown, context: { signal: AbortSignal; error(type: string, message: string, data: unknown): unknown }) => Promise<unknown>
+  let agentStatus!: (input: unknown, context: unknown) => Promise<unknown>
   const assertions: any[] = []
   const ctx = {
     options: input, location: { directory: tmpdir() },
-    rpc: { async register(_definition: unknown, handlers: { switchMode: typeof switchMode }) { switchMode = handlers.switchMode } },
+    rpc: { async register(_definition: unknown, handlers: { setVisibility: typeof setVisibility }) { setVisibility = handlers.setVisibility } },
     permission: { async assert(value: unknown) {
       assertions.push(value)
       throw new Error("Permission denied")
     } },
     tool: { async transform(edit: (editor: unknown) => void) {
-      edit({ namespace() {}, add(tool: { name: string; execute: typeof agentSwitch }) { if (tool.name === "switch_mode") agentSwitch = tool.execute } })
+      edit({ namespace() {}, add(tool: { name: string; execute: typeof agentStatus }) {
+        assert.notEqual(tool.name, "switch_mode")
+        assert.notEqual(tool.name, "set_visibility")
+        if (tool.name === "status") agentStatus = tool.execute
+      } })
     } },
     session: { async hook() {} }, event: { async *subscribe() {} },
   } as unknown as Parameters<typeof plugin.setup>[0]
@@ -103,24 +149,24 @@ test("sidebar mode changes bypass agent permissions while agent tools still enfo
     cleanup = await plugin.setup(ctx)
     const controller = new AbortController()
     const context = { signal: controller.signal, error: (type: string, message: string, data: unknown) => ({ type, message, data }) }
-    for (const mode of ["headed", "headless"]) {
-      assert.deepEqual(await switchMode({ sessionID: "viewed-session", mode }, context), {})
-      assert.deepEqual(execute.mock.calls.at(-1)!.arguments, ["switch_mode", { mode }, {
+    for (const visibility of ["headed", "headless"]) {
+      assert.deepEqual(await setVisibility({ sessionID: "viewed-session", visibility }, context), {})
+      assert.deepEqual(execute.mock.calls.at(-1)!.arguments, ["set_visibility", { visibility }, {
         sessionID: "viewed-session", directory: tmpdir(), signal: controller.signal,
       }])
     }
     assert.equal(assertions.length, 0, "direct user actions must not evaluate ask or deny rules")
-    await assert.rejects(agentSwitch({ mode: "headed" }, {
+    await assert.rejects(agentStatus({}, {
       sessionID: "viewed-session", agent: "build", messageID: "message", id: "tool", signal: controller.signal,
     }), /Permission denied/)
     assert.equal(assertions[0].action, "browser_use")
-    assert.deepEqual(assertions[0].resources, ["switch_mode.headed"])
+    assert.deepEqual(assertions[0].resources, ["status"])
     assert.equal(execute.mock.callCount(), 2)
     controller.abort()
-    await switchMode({ sessionID: "viewed-session", mode: "headed" }, context)
+    await setVisibility({ sessionID: "viewed-session", visibility: "headed" }, context)
     assert.equal(execute.mock.callCount(), 2, "cancelled user actions cannot execute the switch")
     fail = true
-    const rejected = await switchMode({ sessionID: "viewed-session", mode: "headed" }, { ...context, signal: new AbortController().signal }) as { type: string; message: string }
+    const rejected = await setVisibility({ sessionID: "viewed-session", visibility: "headed" }, { ...context, signal: new AbortController().signal }) as { type: string; message: string }
     assert.equal(rejected.type, "switch_failed")
     assert.match(rejected.message, /paused for human login/, "UI actions still obey browser lifecycle constraints")
   } finally {

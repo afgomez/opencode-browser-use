@@ -9,17 +9,17 @@ export const pageTools = new Set([
   "upload_file", "wait_for",
 ])
 
-export type BrowserMode = "headed" | "headless"
+export type BrowserVisibility = "headed" | "headless"
 
-export function browserMode(value: unknown): BrowserMode {
-  if (value !== "headed" && value !== "headless") throw new Error("mode must be headed or headless")
+export function browserVisibility(value: unknown): BrowserVisibility {
+  if (value !== "headed" && value !== "headless") throw new Error("visibility must be headed or headless")
   return value
 }
 
-export function permissionFor(name: string, input: Record<string, unknown> = {}) {
+export function permissionFor(name: string) {
   return {
     action: "browser_use",
-    resources: [name === "switch_mode" ? `switch_mode.${browserMode(input.mode)}` : name],
+    resources: [name],
   }
 }
 

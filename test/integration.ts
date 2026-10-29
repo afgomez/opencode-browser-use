@@ -20,12 +20,12 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
   const directory = await mkdtemp(join(base, "browser-use-test-"))
   const config = options({ profileDirectory: join(directory, "profile") })
   const chrome = new Chrome(config)
-  // Exercise mode switching and the complete login protocol without opening a window or stealing
+  // Exercise visibility switching and the complete login protocol without opening a window or stealing
   // focus during automated tests. Actual headed UI is a separate manual check.
-  const requestedModes: boolean[] = []
+  const headlessLaunches: boolean[] = []
   let browser!: BrowserProcess
   const manager = new BrowserManager(config, { chrome: {
-    start: async (headless) => { requestedModes.push(headless); return browser = await chrome.start(true) }, stop: (release) => chrome.stop(release),
+    start: async (headless) => { headlessLaunches.push(headless); return browser = await chrome.start(true) }, stop: (release) => chrome.stop(release),
   } })
   const server = createServer((request, response) => {
     if (request.url === "/set-cookie") response.setHeader("Set-Cookie", "browser_use_test=authenticated; Max-Age=3600; Path=/; SameSite=Lax")
@@ -40,7 +40,7 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
   const parse = (result: any) => JSON.parse(typeof result.content === "string" ? result.content : result.content[0].text)
   try {
     assert.deepEqual(await manager.inspectPages(a.sessionID), emptySnapshot())
-    assert.deepEqual(requestedModes, [])
+    assert.deepEqual(headlessLaunches, [])
     const catalog = wrappedCatalog(await loadCatalog(config.nodePath))
     assert.ok(catalog.some((tool) => tool.name === "take_snapshot"))
     assert.equal(catalog.length, 21)
@@ -63,7 +63,7 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
       ...emptySnapshot(), pages: [{ pageId: pageA, title: "/set-cookie", url: `${origin}/set-cookie` }],
     })
     assert.equal(Cdp.disconnected(browser.cdp), false)
-    assert.deepEqual(requestedModes, [true], "repairing metadata must not restart Chrome")
+    assert.deepEqual(headlessLaunches, [true], "repairing metadata must not restart Chrome")
     assert.equal((await manager.inspectPages(b.sessionID)).pages[0].pageId, pageB)
     await assert.rejects(manager.execute("take_snapshot", { pageId: pageA }, b), /foreign page handle/)
     const snapshot = await manager.execute("take_snapshot", { pageId: pageA }, a)
@@ -75,24 +75,24 @@ test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, resta
     assert.ok(Array.isArray(screenshot.content) && screenshot.content.some((item) => item.type === "file" && item.mime === "image/jpeg"))
     const competitor = new Chrome(config)
     await assert.rejects(competitor.start(true), /another OpenCode service/)
-    const headed = parse(await manager.execute("switch_mode", { mode: "headed" }, a))
-    assert.equal(headed.mode, "headed")
+    const headed = parse(await manager.execute("set_visibility", { visibility: "headed" }, a))
+    assert.equal(headed.visibility, "headed")
     assert.equal(headed.paused, false)
     assert.deepEqual(headed.pages.map((page: any) => page.pageId), [pageA])
-    assert.equal(parse(await manager.execute("status", {}, b)).mode, "headed")
+    assert.equal(parse(await manager.execute("status", {}, b)).visibility, "headed")
     const visibleSnapshot = await manager.execute("take_snapshot", { pageId: pageB }, b)
     assert.match(JSON.stringify(visibleSnapshot), /b-private/)
-    const beforeNoop = requestedModes.length
-    assert.equal(parse(await manager.execute("switch_mode", { mode: "headed" }, a)).changed, false)
-    assert.equal(requestedModes.length, beforeNoop)
-    await manager.execute("switch_mode", { mode: "headless" }, b)
-    assert.deepEqual(requestedModes, [true, false, true])
+    const beforeNoop = headlessLaunches.length
+    assert.equal(parse(await manager.execute("set_visibility", { visibility: "headed" }, a)).changed, false)
+    assert.equal(headlessLaunches.length, beforeNoop)
+    await manager.execute("set_visibility", { visibility: "headless" }, b)
+    assert.deepEqual(headlessLaunches, [true, false, true])
     assert.equal(parse(await manager.execute("list_pages", {}, a)).pages[0].pageId, pageA)
     await manager.execute("login_start", { pageId: pageA }, a)
     assert.equal((await manager.inspectPages(a.sessionID)).pages[0].pageId, pageA)
     assert.equal(parse(await manager.execute("status", {}, a)).paused, true)
     await assert.rejects(manager.execute("take_snapshot", { pageId: pageB }, b), /paused/)
-    await assert.rejects(manager.execute("switch_mode", { mode: "headless" }, b), /paused for human login/)
+    await assert.rejects(manager.execute("set_visibility", { visibility: "headless" }, b), /paused for human login/)
     await manager.execute("login_finish", {}, a)
     const cookies = await manager.execute("evaluate_script", { pageId: pageA, function: "() => document.cookie" }, a)
     assert.match(JSON.stringify(cookies), /browser_use_test=authenticated/)

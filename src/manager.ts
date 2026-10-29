@@ -4,7 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { Chrome, type BrowserProcess } from "./chrome"
 import { connectMcp, type Mcp } from "./mcp"
 import type { Options } from "./options"
-import { browserMode, data, filteredResult, pageTools, type BrowserMode, type PublicPage } from "./policy"
+import { browserVisibility, data, filteredResult, pageTools, type BrowserVisibility, type PublicPage } from "./policy"
 import { Serial } from "./serial"
 import type { PagesSnapshot } from "./rpc"
 import { Cdp } from "./cdp"
@@ -34,7 +34,7 @@ export class BrowserManager {
   private dependencies: Dependencies
   private maintenanceError?: string
   private restoration?: Page[]
-  private mode: BrowserMode = "headless"
+  private visibility: BrowserVisibility = "headless"
   private retired = false
 
   constructor(readonly config: Options, dependencies?: Partial<Dependencies>) {
@@ -75,26 +75,26 @@ export class BrowserManager {
         return { content: "Headless operation resumed. Cookies persist; pages were reloaded. Take fresh snapshots." }
       }
       if (this.login) throw new Error("Browser automation is paused for human login. The initiating session must call browser_use_login_finish.")
-      if (name === "switch_mode") {
-        const mode = browserMode(input.mode)
-        if (mode === this.mode && !this.restoration && (!this.browser || this.browser.alive())) {
+      if (name === "set_visibility") {
+        const visibility = browserVisibility(input.visibility)
+        if (visibility === this.visibility && !this.restoration && (!this.browser || this.browser.alive())) {
           if (this.browser) this.touch(caller.sessionID)
-          return { content: JSON.stringify({ mode, changed: false, running: !!this.browser, pages: this.publicPages(caller.sessionID) }) }
+          return { content: JSON.stringify({ visibility, changed: false, running: !!this.browser, pages: this.publicPages(caller.sessionID) }) }
         }
         this.touch(caller.sessionID)
-        await this.transition(mode === "headless")
-        if (mode === "headed") {
+        await this.transition(visibility === "headless")
+        if (visibility === "headed") {
           // Show only the requesting session's tab, never another session's tab.
           const page = [...this.pages.values()].find((page) => page.sessionID === caller.sessionID)
           if (page) await this.browser!.cdp.send("Target.activateTarget", { targetId: page.tabId })
         }
         return { content: JSON.stringify({
-          mode, changed: true, running: true, paused: false,
+          visibility, changed: true, running: true, paused: false,
           message: "Browser automation remains enabled. All owned tabs were reloaded; take fresh snapshots.",
           pages: this.publicPages(caller.sessionID),
         }) }
       }
-      if (this.restoration) throw new Error("A browser mode transition failed; automation is paused. Retry browser_use_switch_mode to finish restoring tabs.")
+      if (this.restoration) throw new Error("A browser visibility transition failed; automation is paused. Use /browser-use visibility headed or /browser-use visibility headless to finish restoring tabs.")
       this.touch(caller.sessionID)
       await this.ensure()
       await this.mcp!.roots(caller.directory)
@@ -181,7 +181,7 @@ export class BrowserManager {
     if (!sessionID) throw new Error("Browser inspection requires a session ID")
     return this.serial.run(async () => {
       this.assertActive()
-      const state = { mode: this.mode, paused: !!this.login || !!this.restoration }
+      const state = { visibility: this.visibility, paused: !!this.login || !!this.restoration }
       if (!this.browser?.alive()) return { ...state, pages: [] }
       const owned = [...this.pages.values()].filter((page) => page.sessionID === sessionID)
       if (!owned.length) return { ...state, pages: [] }
@@ -216,7 +216,7 @@ export class BrowserManager {
   private status(sessionID: string) {
     return { content: JSON.stringify({
       running: this.browser?.alive() ?? false,
-      mode: this.mode,
+      visibility: this.visibility,
       paused: !!this.login || !!this.restoration,
       loginOwnedByThisSession: this.login?.sessionID === sessionID,
       leaseHeld: this.leases.has(sessionID),
@@ -233,7 +233,7 @@ export class BrowserManager {
       this.pages.clear() // Browser crashes invalidate every old handle.
       await this.dependencies.chrome.stop()
     }
-    if (!this.browser) this.browser = await this.dependencies.chrome.start(this.mode === "headless")
+    if (!this.browser) this.browser = await this.dependencies.chrome.start(this.visibility === "headless")
     if (!this.mcp) this.mcp = await this.dependencies.connect(this.config.nodePath, this.browser.url)
   }
 
@@ -286,7 +286,7 @@ export class BrowserManager {
     this.browser = undefined
     this.pages.clear()
     this.browser = await this.dependencies.chrome.start(headless)
-    this.mode = headless ? "headless" : "headed"
+    this.visibility = headless ? "headless" : "headed"
     this.mcp = await this.dependencies.connect(this.config.nodePath, this.browser.url)
     for (const saved of this.restoration) {
       const page = await this.createPage(saved.sessionID, saved.pageId)
@@ -366,7 +366,7 @@ export class BrowserManager {
     this.browser = undefined
     this.pages.clear()
     this.restoration = undefined
-    this.mode = "headless"
+    this.visibility = "headless"
   }
 
   private retire() {
@@ -396,8 +396,10 @@ export class BrowserManager {
     Object.setPrototypeOf(manager, BrowserManager.prototype)
     // A relocated plugin must resolve future MCP subprocesses from its new path.
     if (connect) manager.dependencies.connect = connect
-    // Pre-switch_mode managers had no mode field; their login state determines it.
-    manager.mode ??= manager.login ? "headed" : "headless"
+    // Migrate live managers from the old field without changing browser visibility.
+    const legacy = manager as BrowserManager & { mode?: BrowserVisibility }
+    manager.visibility ??= legacy.mode ?? (manager.login ? "headed" : "headless")
+    delete legacy.mode
   }
 }
 

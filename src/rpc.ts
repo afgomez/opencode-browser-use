@@ -1,10 +1,10 @@
 import { Rpc } from "@opencode/plugin/rpc"
-import type { BrowserMode, PublicPage } from "./policy"
+import type { BrowserVisibility, PublicPage } from "./policy"
 
-export interface PagesSnapshot { pages: PublicPage[]; mode: BrowserMode; paused: boolean }
-export const emptySnapshot = (): PagesSnapshot => ({ pages: [], mode: "headless", paused: false })
+export interface PagesSnapshot { pages: PublicPage[]; visibility: BrowserVisibility; paused: boolean }
+export const emptySnapshot = (): PagesSnapshot => ({ pages: [], visibility: "headless", paused: false })
 
-/** Trusted client API. The UI confirms mode changes; agent permission rules apply only to tools. */
+/** Trusted client API. The UI confirms visibility changes; agent permission rules apply only to tools. */
 export const BrowserUse = Rpc.define({
   id: "browser-use",
   methods: {
@@ -17,7 +17,7 @@ export const BrowserUse = Rpc.define({
       output: {
         type: "object",
         properties: {
-          mode: { type: "string", enum: ["headless", "headed"] },
+          visibility: { type: "string", enum: ["headless", "headed"] },
           paused: { type: "boolean" },
           pages: {
             type: "array",
@@ -28,17 +28,17 @@ export const BrowserUse = Rpc.define({
             },
           },
         },
-        required: ["pages", "mode", "paused"], additionalProperties: false,
+        required: ["pages", "visibility", "paused"], additionalProperties: false,
       },
     },
-    switchMode: {
+    setVisibility: {
       input: {
         type: "object",
         properties: {
           sessionID: { type: "string", minLength: 1 },
-          mode: { type: "string", enum: ["headless", "headed"] },
+          visibility: { type: "string", enum: ["headless", "headed"] },
         },
-        required: ["sessionID", "mode"], additionalProperties: false,
+        required: ["sessionID", "visibility"], additionalProperties: false,
       },
       output: { type: "object", additionalProperties: false },
       errors: { switch_failed: { type: "object", additionalProperties: false } },

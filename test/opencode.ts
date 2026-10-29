@@ -26,7 +26,6 @@ test("the real OpenCode V2 server loads the explicitly configured local plugin a
     permissions: [
       { action: "browser_use", resource: "*", effect: "allow" },
       { action: "browser_use", resource: "login_start", effect: "ask" },
-      { action: "browser_use", resource: "switch_mode.headed", effect: "ask" },
     ],
   }))
   const reservation = createServer()
@@ -68,7 +67,6 @@ test("the real OpenCode V2 server loads the explicitly configured local plugin a
     assert.deepEqual(build.permissions.filter((rule: any) => rule.action === "browser_use"), [
       { action: "browser_use", resource: "*", effect: "allow" },
       { action: "browser_use", resource: "login_start", effect: "ask" },
-      { action: "browser_use", resource: "switch_mode.headed", effect: "ask" },
     ])
     const browser = OpenCode.make({ baseUrl: `http://127.0.0.1:${port}`, headers }).rpc(BrowserUse)
     const request = { location: { directory: project } }
@@ -76,13 +74,14 @@ test("the real OpenCode V2 server loads the explicitly configured local plugin a
     for (const input of [{}, { sessionID: "" }, { sessionID: 1 }]) {
       await assert.rejects(browser.pages(input, request), { type: "rpc.invalid_input" })
     }
-    await assert.rejects(browser.switchMode({ sessionID: "sidebar-test", mode: "visible" }, request), { type: "rpc.invalid_input" })
+    await assert.rejects(browser.setVisibility({ sessionID: "sidebar-test", visibility: "visible" }, request), { type: "rpc.invalid_input" })
+    await assert.rejects(browser.setVisibility({ sessionID: "sidebar-test", mode: "headless" }, request), { type: "rpc.invalid_input" })
     const client = OpenCode.make({ baseUrl: `http://127.0.0.1:${port}`, headers })
-    const session = await client.session.create({ location: { directory: project }, title: "Sidebar mode permissions" })
-    await client.session.update({ sessionID: session.id, permissions: [{ action: "browser_use", resource: "switch_mode.*", effect: "deny" }] })
-    assert.deepEqual(await browser.switchMode({ sessionID: session.id, mode: "headless" }, request), {}, "direct user control must ignore agent deny rules")
-    await client.session.update({ sessionID: session.id, permissions: [{ action: "browser_use", resource: "switch_mode.*", effect: "allow" }] })
-    assert.deepEqual(await browser.switchMode({ sessionID: session.id, mode: "headless" }, request), {})
+    const session = await client.session.create({ location: { directory: project }, title: "Sidebar visibility permissions" })
+    await client.session.update({ sessionID: session.id, permissions: [{ action: "browser_use", resource: "*", effect: "deny" }] })
+    assert.deepEqual(await browser.setVisibility({ sessionID: session.id, visibility: "headless" }, request), {}, "direct user control must ignore agent deny rules")
+    await client.session.update({ sessionID: session.id, permissions: [{ action: "browser_use", resource: "*", effect: "allow" }] })
+    assert.deepEqual(await browser.setVisibility({ sessionID: session.id, visibility: "headless" }, request), {})
     assert.deepEqual(await browser.pages({ sessionID: session.id }, request), emptySnapshot())
   } finally {
     const exited = once(child, "exit")

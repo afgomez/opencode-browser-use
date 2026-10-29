@@ -27,7 +27,7 @@ function fixture() {
   let blocked: Promise<void> | undefined
   let releaseBlock: (() => void) | undefined
   let enteredBlock: (() => void) | undefined
-  const modes: boolean[] = []
+  const headlessLaunches: boolean[] = []
   const calls: Array<{ name: string; args: Record<string, unknown> }> = []
   const cdpCalls: string[] = []
   const tabs = new Map<string, { id: number; url: string; title: string }>()
@@ -42,7 +42,7 @@ function fixture() {
     async start(headless: boolean) {
       if (failLaunch) { failLaunch = false; throw new Error("launch failed") }
       running = true
-      modes.push(headless)
+      headlessLaunches.push(headless)
       tabs.set(`tab-${next}`, { id: next++, url: "about:blank", title: "unowned" })
       return { url: "http://fake", cdp, alive: () => running, async stop() {} } as unknown as BrowserProcess
     },
@@ -88,7 +88,7 @@ function fixture() {
     return result.pages.at(-1).pageId as string
   }
   return {
-    manager, open, calls, cdpCalls, tabs, modes, connect,
+    manager, open, calls, cdpCalls, tabs, headlessLaunches, connect,
     advance(ms: number) { now += ms },
     fail() { failNext = true },
     failLaunch() { failLaunch = true },
@@ -106,10 +106,10 @@ function fixture() {
 test("status is lazy; concurrent sessions share one browser but get private handles and listings", async () => {
   const f = fixture()
   assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).running, false)
-  assert.equal(f.modes.length, 0)
+  assert.equal(f.headlessLaunches.length, 0)
   const [a, b] = await Promise.all([f.open("a"), f.open("b")])
   assert.notEqual(a, b)
-  assert.deepEqual(f.modes, [true])
+  assert.deepEqual(f.headlessLaunches, [true])
   for (const [sessionID, pageId] of [["a", a], ["b", b]]) {
     const result = await f.manager.execute("list_pages", {}, caller(sessionID))
     assert.deepEqual(parse(result).pages.map((p: any) => p.pageId), [pageId])
@@ -139,7 +139,7 @@ test("sidebar inspection is lazy and never creates a lease or launches Chrome", 
   const f = fixture()
   try {
     assert.deepEqual(await f.manager.inspectPages("a"), emptySnapshot())
-    assert.deepEqual(f.modes, [])
+    assert.deepEqual(f.headlessLaunches, [])
     assert.deepEqual(f.cdpCalls, [])
     assert.deepEqual(f.calls, [])
     assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).activeLeases, 0)
@@ -181,7 +181,7 @@ test("sidebar polling cannot keep leases or an idle browser alive", async () => 
     await f.manager.inspectPages("a")
     await f.manager.sweep()
     assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).running, false)
-    assert.deepEqual(f.modes, [true])
+    assert.deepEqual(f.headlessLaunches, [true])
   } finally { await f.manager.dispose() }
 })
 
@@ -191,23 +191,23 @@ test("sidebar reads remain passive during login, crash, release, and failed rest
     const a = await f.open("a")
     await f.manager.execute("login_start", { pageId: a }, caller("a"))
     assert.equal((await f.manager.inspectPages("a")).pages[0].pageId, a)
-    assert.equal((await f.manager.inspectPages("a")).mode, "headed")
+    assert.equal((await f.manager.inspectPages("a")).visibility, "headed")
     assert.equal((await f.manager.inspectPages("a")).paused, true)
     assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).paused, true)
     await assert.rejects(f.manager.execute("take_snapshot", { pageId: a }, caller("a")), /paused/)
     await f.manager.execute("login_finish", {}, caller("a"))
     f.failLaunch()
-    await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /launch failed/)
+    await assert.rejects(f.manager.execute("set_visibility", { visibility: "headed" }, caller("a")), /launch failed/)
     assert.deepEqual(await f.manager.inspectPages("a"), { ...emptySnapshot(), paused: true })
-    await f.manager.execute("switch_mode", { mode: "headless" }, caller("a"))
+    await f.manager.execute("set_visibility", { visibility: "headless" }, caller("a"))
     assert.equal((await f.manager.inspectPages("a")).pages[0].pageId, a)
     await f.manager.release("a")
     assert.deepEqual(await f.manager.inspectPages("a"), emptySnapshot())
     await f.open("a")
     f.crash()
-    const before = f.modes.length
+    const before = f.headlessLaunches.length
     assert.deepEqual(await f.manager.inspectPages("a"), emptySnapshot())
-    assert.equal(f.modes.length, before)
+    assert.equal(f.headlessLaunches.length, before)
   } finally { await f.manager.dispose() }
 })
 
@@ -231,7 +231,7 @@ test("sidebar reads serialize with operations and queued cancellation has no bro
     f.failCdp()
     await assert.rejects(f.manager.inspectPages("a"), /disconnected/)
     assert.equal((await f.manager.inspectPages("a")).pages[0].pageId, a)
-    assert.deepEqual(f.modes, [true])
+    assert.deepEqual(f.headlessLaunches, [true])
   } finally { f.unblock(); await f.manager.dispose() }
 })
 
@@ -255,7 +255,7 @@ test("MCP failure is not retried; reconnect remaps tab identities instead of tru
   await assert.rejects(f.manager.execute("take_snapshot", { pageId: a }, caller("a")), /connection lost/)
   const result = await f.manager.execute("evaluate_script", { pageId: a }, caller("a"))
   assert.equal(parse(result).message, "https://a.test/")
-  assert.deepEqual(f.modes, [true])
+  assert.deepEqual(f.headlessLaunches, [true])
   await f.manager.dispose()
 })
 
@@ -266,14 +266,14 @@ test("login drains the queue, pauses all sessions, preserves handles, and requir
   f.block()
   const operation = f.manager.execute("evaluate_script", { pageId: b }, caller("b"))
   const login = f.manager.execute("login_start", { pageId: a }, caller("a"))
-  assert.deepEqual(f.modes, [true])
+  assert.deepEqual(f.headlessLaunches, [true])
   f.unblock()
   await Promise.all([operation, login])
-  assert.deepEqual(f.modes, [true, false])
+  assert.deepEqual(f.headlessLaunches, [true, false])
   await assert.rejects(f.manager.execute("take_snapshot", { pageId: b }, caller("b")), /paused/)
   await assert.rejects(f.manager.execute("login_finish", {}, caller("b")), /Only the session/)
   await f.manager.execute("login_finish", {}, caller("a"))
-  assert.deepEqual(f.modes, [true, false, true])
+  assert.deepEqual(f.headlessLaunches, [true, false, true])
   assert.equal(parse(await f.manager.execute("evaluate_script", { pageId: b }, caller("b"))).message, "https://b.test/")
   await f.manager.dispose()
 })
@@ -284,95 +284,95 @@ test("abandoned login automatically returns headless", async () => {
   await f.manager.execute("login_start", { pageId: a }, caller("a"))
   f.advance(501)
   await f.manager.sweep()
-  assert.deepEqual(f.modes, [true, false, true])
+  assert.deepEqual(f.headlessLaunches, [true, false, true])
   assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).paused, false)
   await f.manager.dispose()
 })
 
-test("mode switches preserve session handles and allow automation in headed and headless modes", async () => {
+test("visibility switches preserve session handles and allow automation both headed and headless", async () => {
   const f = fixture()
   const a = await f.open("a")
   const b = await f.open("b")
-  for (const mode of ["headed", "headless"] as const) {
-    const switched = parse(await f.manager.execute("switch_mode", { mode }, caller("a")))
-    assert.equal(switched.mode, mode)
+  for (const visibility of ["headed", "headless"] as const) {
+    const switched = parse(await f.manager.execute("set_visibility", { visibility }, caller("a")))
+    assert.equal(switched.visibility, visibility)
     assert.equal(switched.changed, true)
     assert.equal(switched.paused, false)
     assert.deepEqual(switched.pages.map((page: any) => page.pageId), [a])
     const status = parse(await f.manager.execute("status", {}, caller("b")))
-    assert.equal(status.mode, mode)
+    assert.equal(status.visibility, visibility)
     assert.equal(status.paused, false)
     assert.equal(parse(await f.manager.execute("evaluate_script", { pageId: b }, caller("b"))).message, "https://b.test/")
     await assert.rejects(f.manager.execute("take_snapshot", { pageId: b }, caller("a")), /foreign page handle/)
   }
-  assert.deepEqual(f.modes, [true, false, true])
+  assert.deepEqual(f.headlessLaunches, [true, false, true])
   await f.manager.dispose()
 })
 
-test("already-selected modes are no-ops, including headless before Chrome has started", async () => {
+test("already-selected visibility settings are no-ops, including headless before Chrome has started", async () => {
   const f = fixture()
-  const initial = parse(await f.manager.execute("switch_mode", { mode: "headless" }, caller("a")))
+  const initial = parse(await f.manager.execute("set_visibility", { visibility: "headless" }, caller("a")))
   assert.equal(initial.changed, false)
   assert.equal(initial.running, false)
-  assert.deepEqual(f.modes, [])
-  assert.equal(parse(await f.manager.execute("switch_mode", { mode: "headed" }, caller("a"))).changed, true)
-  assert.deepEqual(f.modes, [false]) // Never launch headless just to immediately restart headed.
+  assert.deepEqual(f.headlessLaunches, [])
+  assert.equal(parse(await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a"))).changed, true)
+  assert.deepEqual(f.headlessLaunches, [false]) // Never launch headless just to immediately restart headed.
   const a = await f.open("a")
-  assert.equal(parse(await f.manager.execute("switch_mode", { mode: "headed" }, caller("a"))).changed, false)
+  assert.equal(parse(await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a"))).changed, false)
   assert.equal(parse(await f.manager.execute("list_pages", {}, caller("a"))).pages[0].pageId, a)
-  assert.deepEqual(f.modes, [false])
+  assert.deepEqual(f.headlessLaunches, [false])
   await f.manager.dispose()
 })
 
-test("invalid modes are rejected without launching or restarting Chrome", async () => {
+test("invalid visibility settings are rejected without launching or restarting Chrome", async () => {
   const f = fixture()
-  for (const mode of [undefined, "visible", true, {}, "headed.extra"]) {
-    await assert.rejects(f.manager.execute("switch_mode", { mode }, caller("a")), /mode must be headed or headless/)
+  for (const visibility of [undefined, "visible", true, {}, "headed.extra"]) {
+    await assert.rejects(f.manager.execute("set_visibility", { visibility }, caller("a")), /visibility must be headed or headless/)
   }
-  assert.deepEqual(f.modes, [])
+  assert.deepEqual(f.headlessLaunches, [])
   await f.manager.dispose()
 })
 
-test("mode switches wait for in-flight browser operations to finish", async () => {
+test("visibility switches wait for in-flight browser operations to finish", async () => {
   const f = fixture()
   const a = await f.open("a")
   const entered = f.block()
   const reading = f.manager.execute("evaluate_script", { pageId: a }, caller("a"))
   await entered
-  const switching = f.manager.execute("switch_mode", { mode: "headed" }, caller("b"))
-  assert.deepEqual(f.modes, [true])
+  const switching = f.manager.execute("set_visibility", { visibility: "headed" }, caller("b"))
+  assert.deepEqual(f.headlessLaunches, [true])
   f.unblock()
   await Promise.all([reading, switching])
-  assert.deepEqual(f.modes, [true, false])
+  assert.deepEqual(f.headlessLaunches, [true, false])
   await f.manager.dispose()
 })
 
-test("switch_mode cannot bypass a human login pause, even when requesting the current mode", async () => {
+test("set_visibility cannot bypass a human login pause, even when requesting the current visibility", async () => {
   const f = fixture()
   const a = await f.open("a")
   await f.manager.execute("login_start", { pageId: a }, caller("a"))
-  assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).mode, "headed")
+  assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).visibility, "headed")
   for (const sessionID of ["a", "b"]) {
-    for (const mode of ["headed", "headless"]) {
-      await assert.rejects(f.manager.execute("switch_mode", { mode }, caller(sessionID)), /paused for human login/)
+    for (const visibility of ["headed", "headless"]) {
+      await assert.rejects(f.manager.execute("set_visibility", { visibility }, caller(sessionID)), /paused for human login/)
     }
   }
-  assert.deepEqual(f.modes, [true, false])
+  assert.deepEqual(f.headlessLaunches, [true, false])
   await f.manager.execute("login_finish", {}, caller("a"))
-  assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).mode, "headless")
+  assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).visibility, "headless")
   await f.manager.dispose()
 })
 
-test("failed mode changes pause automation and can be retried without losing owned tabs", async () => {
+test("failed visibility changes pause automation and can be retried without losing owned tabs", async () => {
   const f = fixture()
   const a = await f.open("a")
   const b = await f.open("b")
   f.failLaunch()
-  await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /launch failed/)
+  await assert.rejects(f.manager.execute("set_visibility", { visibility: "headed" }, caller("a")), /launch failed/)
   assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).paused, true)
-  await assert.rejects(f.manager.execute("take_snapshot", { pageId: a }, caller("a")), /mode transition failed/)
-  // Retrying the previous mode must not be mistaken for an already-selected no-op.
-  const retry = parse(await f.manager.execute("switch_mode", { mode: "headless" }, caller("a")))
+  await assert.rejects(f.manager.execute("take_snapshot", { pageId: a }, caller("a")), /visibility transition failed/)
+  // Retrying the previous visibility must not be mistaken for an already-selected no-op.
+  const retry = parse(await f.manager.execute("set_visibility", { visibility: "headless" }, caller("a")))
   assert.equal(retry.changed, true)
   assert.equal(retry.paused, false)
   assert.equal(retry.pages[0].pageId, a)
@@ -380,19 +380,19 @@ test("failed mode changes pause automation and can be retried without losing own
   await f.manager.dispose()
 })
 
-test("restoration navigation errors keep mode changes paused and preserve every session's tabs for retry", async () => {
+test("restoration navigation errors keep visibility changes paused and preserve every session's tabs for retry", async () => {
   const f = fixture()
   try {
     const a = await f.open("a")
     const b = await f.open("b")
     // Fail after the first session's tab has already been restored.
     f.failNavigation("https://b.test/")
-    await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /restoration navigation failed/)
+    await assert.rejects(f.manager.execute("set_visibility", { visibility: "headed" }, caller("a")), /restoration navigation failed/)
     assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).paused, true)
-    await assert.rejects(f.manager.execute("take_snapshot", { pageId: a }, caller("a")), /mode transition failed/)
-    await assert.rejects(f.manager.execute("take_snapshot", { pageId: b }, caller("b")), /mode transition failed/)
+    await assert.rejects(f.manager.execute("take_snapshot", { pageId: a }, caller("a")), /visibility transition failed/)
+    await assert.rejects(f.manager.execute("take_snapshot", { pageId: b }, caller("b")), /visibility transition failed/)
 
-    const retry = parse(await f.manager.execute("switch_mode", { mode: "headed" }, caller("a")))
+    const retry = parse(await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a")))
     assert.equal(retry.changed, true)
     assert.equal(retry.paused, false)
     for (const [sessionID, pageId] of [["a", a], ["b", b]]) {
@@ -426,14 +426,14 @@ for (const phase of ["login_start", "login_finish"] as const) {
   })
 }
 
-test("releasing a session during a failed mode change never resurrects its tabs on retry", async () => {
+test("releasing a session during a failed visibility change never resurrects its tabs on retry", async () => {
   const f = fixture()
   await f.open("a")
   const b = await f.open("b")
   f.failLaunch()
-  await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /launch failed/)
+  await assert.rejects(f.manager.execute("set_visibility", { visibility: "headed" }, caller("a")), /launch failed/)
   await f.manager.release("a")
-  await f.manager.execute("switch_mode", { mode: "headless" }, caller("b"))
+  await f.manager.execute("set_visibility", { visibility: "headless" }, caller("b"))
   assert.deepEqual(parse(await f.manager.execute("status", {}, caller("a"))).pages, [])
   assert.equal(parse(await f.manager.execute("list_pages", {}, caller("b"))).pages[0].pageId, b)
   await f.manager.dispose()
@@ -441,15 +441,15 @@ test("releasing a session during a failed mode change never resurrects its tabs 
 
 test("idle shutdown resets the default to headless", async () => {
   const f = fixture()
-  await f.manager.execute("switch_mode", { mode: "headed" }, caller("a"))
+  await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a"))
   await f.manager.release("a")
   f.advance(101)
   await f.manager.sweep()
   const status = parse(await f.manager.execute("status", {}, caller("a")))
   assert.equal(status.running, false)
-  assert.equal(status.mode, "headless")
+  assert.equal(status.visibility, "headless")
   await f.open("b")
-  assert.deepEqual(f.modes, [false, true])
+  assert.deepEqual(f.headlessLaunches, [false, true])
   await f.manager.dispose()
 })
 
@@ -458,10 +458,10 @@ for (const cleanup of ["release", "lease expiry"] as const) {
     const f = fixture()
     const detach = f.manager.attach()
     try {
-      await f.manager.execute("switch_mode", { mode: "headed" }, caller("a"))
+      await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a"))
       await f.open("a")
       f.failLaunch()
-      await assert.rejects(f.manager.execute("switch_mode", { mode: "headless" }, caller("a")), /launch failed/)
+      await assert.rejects(f.manager.execute("set_visibility", { visibility: "headless" }, caller("a")), /launch failed/)
       if (cleanup === "release") await f.manager.release("a")
       else { f.advance(1001); await f.manager.sweep() }
 
@@ -477,10 +477,10 @@ for (const cleanup of ["release", "lease expiry"] as const) {
       const cleaned = parse(await f.manager.execute("status", {}, caller("a")))
       assert.equal(cleaned.running, false)
       assert.equal(cleaned.paused, false)
-      assert.equal(cleaned.mode, "headless")
+      assert.equal(cleaned.visibility, "headless")
       assert.deepEqual(cleaned.pages, [])
       await f.open("b")
-      assert.deepEqual(f.modes, [false, true])
+      assert.deepEqual(f.headlessLaunches, [false, true])
       assert.deepEqual(parse(await f.manager.execute("list_pages", {}, caller("a"))).pages, [])
     } finally { detach(); await f.manager.dispose() }
   })
@@ -492,14 +492,14 @@ test("idle cleanup does not discard failed restoration while another session hol
     await f.open("a")
     const b = await f.open("b")
     f.failLaunch()
-    await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /launch failed/)
+    await assert.rejects(f.manager.execute("set_visibility", { visibility: "headed" }, caller("a")), /launch failed/)
     await f.manager.release("a")
     f.advance(101)
     await f.manager.sweep()
     const status = parse(await f.manager.execute("status", {}, caller("b")))
     assert.equal(status.paused, true)
     assert.equal(status.leaseHeld, true)
-    await f.manager.execute("switch_mode", { mode: "headless" }, caller("b"))
+    await f.manager.execute("set_visibility", { visibility: "headless" }, caller("b"))
     const pages = parse(await f.manager.execute("list_pages", {}, caller("b"))).pages
     assert.equal(pages[0].pageId, b)
     assert.equal(pages[0].url, "https://b.test/")
@@ -512,7 +512,7 @@ test("unload cleanup retires a failed restart after releasing its leases and wai
   try {
     await f.open("a")
     f.failLaunch()
-    await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /launch failed/)
+    await assert.rejects(f.manager.execute("set_visibility", { visibility: "headed" }, caller("a")), /launch failed/)
     detach()
     f.advance(201)
     await f.manager.sweep()
@@ -529,29 +529,60 @@ test("unload cleanup retires a failed restart after releasing its leases and wai
 test("additive hot reload upgrades a live manager without discarding leases or tabs", async () => {
   const f = fixture()
   const a = await f.open("a")
-  Reflect.deleteProperty(f.manager, "mode") // Legacy managers had no explicit mode field.
+  Reflect.deleteProperty(f.manager, "visibility") // Legacy managers had no explicit visibility field.
   Object.setPrototypeOf(f.manager, Object.create(BrowserManager.prototype))
   BrowserManager.upgrade(f.manager)
   assert.equal(Object.getPrototypeOf(f.manager), BrowserManager.prototype)
-  assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).mode, "headless")
+  assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).visibility, "headless")
   assert.equal(parse(await f.manager.execute("list_pages", {}, caller("a"))).pages[0].pageId, a)
-  await f.manager.execute("switch_mode", { mode: "headed" }, caller("a"))
+  await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a"))
   BrowserManager.upgrade(f.manager)
-  assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).mode, "headed")
-  assert.deepEqual(f.modes, [true, false])
+  assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).visibility, "headed")
+  assert.deepEqual(f.headlessLaunches, [true, false])
   await f.manager.dispose()
 })
+
+for (const visibility of ["headed", "headless"] as const) {
+  test(`hot reload migrates legacy browser visibility ${visibility} without restarting or losing handles`, async () => {
+    const f = fixture()
+    try {
+      const a = await f.open("a")
+      await f.manager.execute("set_visibility", { visibility }, caller("a"))
+      const before = [...f.headlessLaunches]
+      // Model a live instance from before the terminology change.
+      Reflect.set(f.manager, "mode", visibility)
+      Reflect.deleteProperty(f.manager, "visibility")
+      BrowserManager.upgrade(f.manager)
+      const status = parse(await f.manager.execute("status", {}, caller("a")))
+      assert.equal(status.visibility, visibility)
+      assert.equal(status.paused, false)
+      assert.equal(status.leaseHeld, true)
+      assert.ok(!("mode" in status))
+      assert.equal(Reflect.has(f.manager, "mode"), false)
+      assert.equal((await f.manager.inspectPages("a")).visibility, visibility)
+      assert.equal((await f.manager.inspectPages("a")).pages[0].pageId, a)
+      const unchanged = parse(await f.manager.execute("set_visibility", { visibility }, caller("a")))
+      assert.equal(unchanged.changed, false)
+      assert.deepEqual(f.headlessLaunches, before)
+      // Later reloads must preserve the new field rather than a stale legacy value.
+      Reflect.set(f.manager, "mode", visibility === "headed" ? "headless" : "headed")
+      BrowserManager.upgrade(f.manager)
+      assert.equal(parse(await f.manager.execute("status", {}, caller("a"))).visibility, visibility)
+      assert.equal(Reflect.has(f.manager, "mode"), false)
+    } finally { await f.manager.dispose() }
+  })
+}
 
 test("upgrading a legacy manager preserves an active human-login pause", async () => {
   const f = fixture()
   const a = await f.open("a")
   await f.manager.execute("login_start", { pageId: a }, caller("a"))
-  Reflect.deleteProperty(f.manager, "mode")
+  Reflect.deleteProperty(f.manager, "visibility")
   BrowserManager.upgrade(f.manager)
   const status = parse(await f.manager.execute("status", {}, caller("a")))
-  assert.equal(status.mode, "headed")
+  assert.equal(status.visibility, "headed")
   assert.equal(status.paused, true)
-  await assert.rejects(f.manager.execute("switch_mode", { mode: "headless" }, caller("a")), /paused for human login/)
+  await assert.rejects(f.manager.execute("set_visibility", { visibility: "headless" }, caller("a")), /paused for human login/)
   await f.manager.dispose()
 })
 
@@ -568,7 +599,7 @@ test("reloading after relocation refreshes the private MCP connector without res
   const result = await f.manager.execute("evaluate_script", { pageId: a }, caller("a"))
   assert.equal(reconnectedFromNewLocation, true)
   assert.equal(parse(result).message, "https://a.test/")
-  assert.deepEqual(f.modes, [true])
+  assert.deepEqual(f.headlessLaunches, [true])
   await f.manager.dispose()
 })
 
@@ -622,7 +653,7 @@ test("cancellation in the queue never starts a browser operation", async () => {
   const controller = new AbortController()
   controller.abort()
   await assert.rejects(f.manager.execute("new_page", { url: "https://a.test" }, caller("a", controller.signal)), /abort/i)
-  assert.deepEqual(f.modes, [])
+  assert.deepEqual(f.headlessLaunches, [])
   await f.manager.dispose()
 })
 
@@ -705,9 +736,4 @@ test("all tools share one permission action and expose their operation as the re
   for (const name of [...pageTools, "new_page", "list_pages", "close_page", "select_page", "status", "release", "login_start", "login_finish"]) {
     assert.deepEqual(permissionFor(name), { action: "browser_use", resources: [name] })
   }
-  for (const mode of ["headed", "headless"]) {
-    assert.deepEqual(permissionFor("switch_mode", { mode }), { action: "browser_use", resources: [`switch_mode.${mode}`] })
-  }
-  assert.throws(() => permissionFor("switch_mode"), /mode must be headed or headless/)
-  assert.throws(() => permissionFor("switch_mode", { mode: "visible" }), /mode must be headed or headless/)
 })
