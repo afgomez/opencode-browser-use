@@ -6,10 +6,10 @@ import { connectMcp, type Mcp } from "./mcp"
 import type { Options } from "./options"
 import { browserVisibility, data, filteredResult, pageTools, type BrowserVisibility, type PublicPage } from "./policy"
 import { Serial } from "./serial"
-import type { PagesSnapshot } from "./rpc"
 import { Cdp } from "./cdp"
 
 export interface Caller { sessionID: string; directory: string; signal?: AbortSignal }
+export interface ManagerSnapshot { pages: PublicPage[]; visibility: BrowserVisibility; paused: boolean }
 interface Page extends PublicPage { sessionID: string; tabId: string; upstreamId: number }
 interface Lease { touched: number }
 interface Login { sessionID: string; deadline: number }
@@ -120,17 +120,13 @@ export class BrowserManager {
         await this.refresh()
         if (!this.pages.has(page.pageId)) throw new Error("This page has closed")
         this.assertRestartAllowed()
+        // Remain paused: a failed transition must not silently enable automation
+        // in a partly restored headed browser. login_finish can retry recovery.
         this.login = { sessionID: caller.sessionID, deadline: this.dependencies.now() + this.config.loginTimeoutMs }
-        try {
-          await this.transition(false)
-          // Focus only at the explicit human handoff, never ordinary automation.
-          const restored = this.owned(page.pageId, caller.sessionID)
-          await this.browser!.cdp.send("Target.activateTarget", { targetId: restored.tabId })
-        } catch (error) {
-          // Remain paused: a failed transition must not silently enable automation
-          // in a partly restored headed browser. login_finish can retry recovery.
-          throw error
-        }
+        await this.transition(false)
+        // Focus only at the explicit human handoff, never ordinary automation.
+        const restored = this.owned(page.pageId, caller.sessionID)
+        await this.browser!.cdp.send("Target.activateTarget", { targetId: restored.tabId })
         return { content: "Chrome is open for human login; all browser automation is paused. When finished, call browser_use_login_finish. Tabs were reloaded; snapshots are stale." }
       }
       if (name === "new_page") {
@@ -156,7 +152,7 @@ export class BrowserManager {
       await this.refresh()
       page = this.owned(page.pageId, caller.sessionID)
       if (name === "close_page") {
-        await this.closeTab(page)
+        await this.closeTab(page.tabId)
         this.pages.delete(page.pageId)
         return { content: JSON.stringify({ pages: this.publicPages(caller.sessionID) }) }
       }
@@ -195,7 +191,7 @@ export class BrowserManager {
   }
 
   /** Passive UI inspection: never launch/restart Chrome, touch leases, or select a page. */
-  async inspectPages(sessionID: string, signal?: AbortSignal): Promise<PagesSnapshot> {
+  async inspectPages(sessionID: string, signal?: AbortSignal): Promise<ManagerSnapshot> {
     if (!sessionID) throw new Error("Browser inspection requires a session ID")
     return this.serial.run(() => this.inspectTransfer(sessionID), signal)
   }
@@ -212,7 +208,7 @@ export class BrowserManager {
     if (this.transferPins.size) throw new Error("Browser restart blocked by an incomplete mode switch. Retry browser inspection or mode switching in the affected session to finish recovery.")
   }
 
-  async inspectTransfer(sessionID: string): Promise<PagesSnapshot> {
+  async inspectTransfer(sessionID: string): Promise<ManagerSnapshot> {
       this.assertActive()
       await this.invalidateDeadBrowser()
       const state = { visibility: this.visibility, paused: !!this.login || !!this.restoration }
@@ -319,6 +315,15 @@ export class BrowserManager {
     return page
   }
 
+  private async restorePage(sessionID: string, saved: PublicPage, signal?: AbortSignal) {
+    signal?.throwIfAborted()
+    const page = await this.createPage(sessionID, saved.pageId)
+    // Reopen only HTTP(S); never replay javascript/data/file URLs or form submissions.
+    if (/^https?:\/\//i.test(saved.url)) {
+      data(await this.call("navigate_page", { pageId: page.upstreamId, url: saved.url }, signal))
+    }
+  }
+
   private async cleanupPending(sessionID?: string) {
     const markers = [...this.pendingPages].filter(([, owner]) => !sessionID || owner === sessionID)
     if (!markers.length) return
@@ -329,7 +334,7 @@ export class BrowserManager {
     )
     for (const [marker] of markers) {
       for (const target of targetInfos.filter((target) => target.type === "tab" && target.url === marker)) {
-        await this.closeTab({ tabId: target.targetId } as Page)
+        await this.closeTab(target.targetId)
       }
       this.pendingPages.delete(marker)
     }
@@ -349,11 +354,7 @@ export class BrowserManager {
     this.visibility = headless ? "headless" : "headed"
     this.mcp = await this.dependencies.connect(this.config.nodePath, this.browser.url)
     for (const saved of this.restoration) {
-      const page = await this.createPage(saved.sessionID, saved.pageId)
-      // Do not replay javascript/data/file URLs or form submissions during login.
-      if (/^https?:\/\//i.test(saved.url)) {
-        data(await this.call("navigate_page", { pageId: page.upstreamId, url: saved.url }))
-      }
+      await this.restorePage(saved.sessionID, saved)
     }
     await this.refresh()
     this.restoration = undefined
@@ -362,10 +363,6 @@ export class BrowserManager {
   async release(sessionID: string) { return this.serial.run(() => this.releaseSession(sessionID)) }
 
   /** Prepare replacement tabs without disturbing the source manager. */
-  async prepareTransfer(sessionID: string, pages: PublicPage[], signal?: AbortSignal) {
-    return this.serial.run(() => this.prepareTransferLocked(sessionID, pages, signal), signal)
-  }
-
   async prepareTransferLocked(sessionID: string, pages: PublicPage[], signal?: AbortSignal) {
       this.assertActive()
       if (this.login || this.restoration) throw new Error("Destination browser is paused for login or recovery")
@@ -376,9 +373,7 @@ export class BrowserManager {
       this.touch(sessionID)
       await this.ensure()
       for (const saved of pages) {
-        signal?.throwIfAborted()
-        const page = await this.createPage(sessionID, saved.pageId)
-        if (/^https?:\/\//i.test(saved.url)) data(await this.call("navigate_page", { pageId: page.upstreamId, url: saved.url }, signal))
+        await this.restorePage(sessionID, saved, signal)
       }
       signal?.throwIfAborted()
       await this.refresh()
@@ -410,7 +405,7 @@ export class BrowserManager {
       // Stable CDP tab IDs, not potentially stale MCP indexes.
       if (this.browser?.alive()) {
         if (Cdp.disconnected(this.browser.cdp)) await Cdp.reconnect(this.browser.cdp)
-        await this.closeTab(page)
+        await this.closeTab(page.tabId)
       }
       this.pages.delete(page.pageId)
     }
@@ -418,8 +413,8 @@ export class BrowserManager {
     if (!this.leases.size && this.idleAt === undefined) this.idleAt = this.dependencies.now()
   }
 
-  private async closeTab(page: Page) {
-    try { await this.browser!.cdp.send("Target.closeTarget", { targetId: page.tabId }) } catch (error) {
+  private async closeTab(tabId: string) {
+    try { await this.browser!.cdp.send("Target.closeTarget", { targetId: tabId }) } catch (error) {
       // A human may have closed an owned tab since our last catalog refresh.
       if (!(error instanceof Error) || !/No target|not found|already closed/i.test(error.message)) throw error
     }
@@ -498,7 +493,12 @@ export class BrowserManager {
     Object.setPrototypeOf(manager, BrowserManager.prototype)
     // A relocated plugin must resolve future MCP subprocesses from its new path.
     if (connect) manager.dependencies.connect = connect
-    // Migrate live managers from the old field without changing browser visibility.
+    BrowserManager.migrateLegacyState(manager)
+  }
+
+  // Retain until all supported processes have restarted: hot reloads reuse
+  // instances whose constructors predate these fields and the mode rename.
+  private static migrateLegacyState(manager: BrowserManager) {
     const legacy = manager as BrowserManager & { mode?: BrowserVisibility }
     manager.pendingPages ??= new Map()
     manager.transferPins ??= new Set()

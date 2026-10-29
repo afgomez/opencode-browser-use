@@ -2,8 +2,8 @@ import { Rpc } from "@opencode/plugin/rpc"
 import type { BrowserVisibility, PublicPage } from "./policy"
 import type { BrowserMode } from "./router"
 
-export interface PagesSnapshot { pages: PublicPage[]; visibility: BrowserVisibility | null; paused: boolean; mode?: BrowserMode }
-export const emptySnapshot = (): PagesSnapshot => ({ pages: [], visibility: "headless", paused: false })
+export interface PagesSnapshot { pages: PublicPage[]; visibility: BrowserVisibility | null; paused: boolean; mode: BrowserMode }
+export const emptySnapshot = (): PagesSnapshot => ({ pages: [], visibility: "headless", paused: false, mode: "shared" })
 
 /** Trusted client API. The UI confirms visibility changes; agent permission rules apply only to tools. */
 export const BrowserUse = Rpc.define({

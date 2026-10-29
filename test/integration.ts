@@ -6,15 +6,16 @@ import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
-import { BrowserManager } from "../src/manager"
+import { BrowserManager, type ManagerSnapshot } from "../src/manager"
 import { Chrome, type BrowserProcess } from "../src/chrome"
 import { Cdp } from "../src/cdp"
 import { loadCatalog } from "../src/mcp"
 import { options } from "../src/options"
 import { wrappedCatalog } from "../src/policy"
-import { emptySnapshot } from "../src/rpc"
 import { AttachChrome } from "../src/attach-chrome"
 import { BrowserRouter } from "../src/router"
+
+const emptySnapshot = (): ManagerSnapshot => ({ pages: [], visibility: "headless", paused: false })
 
 test("real Chrome + private MCP: concurrency, scope, screenshots, cookies, restarts, locks, cleanup", { timeout: 180_000 }, async () => {
   const base = join(tmpdir(), "opencode")

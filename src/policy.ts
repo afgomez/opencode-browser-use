@@ -16,13 +16,6 @@ export function browserVisibility(value: unknown): BrowserVisibility {
   return value
 }
 
-export function permissionFor(name: string) {
-  return {
-    action: "browser_use",
-    resources: [name],
-  }
-}
-
 export function wrappedCatalog(catalog: Tool[]): Tool[] {
   return catalog.filter((tool) => pageTools.has(tool.name)).map((tool) => {
     const inputSchema = structuredClone(tool.inputSchema)

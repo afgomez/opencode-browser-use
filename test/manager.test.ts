@@ -1,14 +1,14 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
-import { BrowserManager, sharedManager } from "../src/manager"
+import { BrowserManager, sharedManager, type ManagerSnapshot } from "../src/manager"
 import { options } from "../src/options"
-import { filteredResult, pageTools, permissionFor, wrappedCatalog } from "../src/policy"
+import { filteredResult, pageTools, wrappedCatalog } from "../src/policy"
 import type { Mcp } from "../src/mcp"
 import type { BrowserProcess } from "../src/chrome"
-import { emptySnapshot } from "../src/rpc"
 import { Cdp } from "../src/cdp"
 
+const emptySnapshot = (): ManagerSnapshot => ({ pages: [], visibility: "headless", paused: false })
 const config = () => options({ profileDirectory: "/test/browser", idleTimeoutMs: 100, leaseTimeoutMs: 1000, loginTimeoutMs: 500, unloadGraceMs: 200 })
 const caller = (sessionID: string, signal?: AbortSignal) => ({ sessionID, directory: "/workspace", signal })
 const structured = (value: Record<string, unknown>): CallToolResult => ({ content: [{ type: "text", text: "UNFILTERED GLOBAL SECRETS" }], structuredContent: value })
@@ -116,10 +116,10 @@ test("transfer prepares only HTTP(S) URLs with preserved handles and leaves othe
   const f = fixture()
   try {
     const other = await f.open("b")
-    await f.manager.prepareTransfer("a", [
+    await f.manager.withTransfer(() => f.manager.prepareTransferLocked("a", [
       { pageId: "http-handle", url: "https://example.test/path", title: "old" },
       { pageId: "unsafe-handle", url: "file:///secret", title: "old" },
-    ])
+    ]))
     const pages = (await f.manager.inspectPages("a")).pages
     assert.deepEqual(pages.map((page) => page.pageId), ["http-handle", "unsafe-handle"])
     assert.equal(pages[0].url, "https://example.test/path")
@@ -136,7 +136,7 @@ test("transfer verification detects browser crash and closed replacement tabs", 
     const f = fixture()
     const pages = [{ pageId: "stable", url: "https://example.test/", title: "" }]
     try {
-      await f.manager.prepareTransfer("a", pages)
+      await f.manager.withTransfer(() => f.manager.prepareTransferLocked("a", pages))
       await f.manager.withTransfer(() => f.manager.validateTransfer("a", pages))
       if (failure === "crash") f.crash()
       else for (const [id, tab] of f.tabs) if (tab.url === pages[0].url) f.tabs.delete(id)
@@ -170,7 +170,7 @@ test("failed transfer preparation retains tracked tabs for cleanup without repla
   const f = fixture()
   try {
     f.failNavigation("https://bad.test/")
-    await assert.rejects(f.manager.prepareTransfer("a", [{ pageId: "id", url: "https://bad.test/", title: "" }]), /restoration navigation failed/)
+    await assert.rejects(f.manager.withTransfer(() => f.manager.prepareTransferLocked("a", [{ pageId: "id", url: "https://bad.test/", title: "" }])), /restoration navigation failed/)
     assert.equal(f.calls.filter((call) => call.name === "navigate_page").length, 1)
     await f.manager.release("a")
     assert.deepEqual((await f.manager.inspectPages("a")).pages, [])
@@ -396,21 +396,31 @@ test("MCP failure is not retried; reconnect remaps tab identities instead of tru
 
 test("login drains the queue, pauses all sessions, preserves handles, and requires its owner", async () => {
   const f = fixture()
-  const a = await f.open("a")
-  const b = await f.open("b")
-  f.block()
-  const operation = f.manager.execute("evaluate_script", { pageId: b }, caller("b"))
-  const login = f.manager.execute("login_start", { pageId: a }, caller("a"))
-  assert.deepEqual(f.headlessLaunches, [true])
-  f.unblock()
-  await Promise.all([operation, login])
-  assert.deepEqual(f.headlessLaunches, [true, false])
-  await assert.rejects(f.manager.execute("take_snapshot", { pageId: b }, caller("b")), /paused/)
-  await assert.rejects(f.manager.execute("login_finish", {}, caller("b")), /Only the session/)
-  await f.manager.execute("login_finish", {}, caller("a"))
-  assert.deepEqual(f.headlessLaunches, [true, false, true])
-  assert.equal(parse(await f.manager.execute("evaluate_script", { pageId: b }, caller("b"))).message, "https://b.test/")
-  await f.manager.dispose()
+  const pending: Promise<unknown>[] = []
+  try {
+    const a = await f.open("a")
+    const b = await f.open("b")
+    const entered = f.block()
+    const operation = f.manager.execute("evaluate_script", { pageId: b }, caller("b"))
+    pending.push(operation)
+    await entered
+    const login = f.manager.execute("login_start", { pageId: a }, caller("a"))
+    pending.push(login)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.deepEqual(f.headlessLaunches, [true], "login must wait for the active operation before restarting Chrome")
+    f.unblock()
+    await Promise.all([operation, login])
+    assert.deepEqual(f.headlessLaunches, [true, false])
+    await assert.rejects(f.manager.execute("take_snapshot", { pageId: b }, caller("b")), /paused/)
+    await assert.rejects(f.manager.execute("login_finish", {}, caller("b")), /Only the session/)
+    await f.manager.execute("login_finish", {}, caller("a"))
+    assert.deepEqual(f.headlessLaunches, [true, false, true])
+    assert.equal(parse(await f.manager.execute("evaluate_script", { pageId: b }, caller("b"))).message, "https://b.test/")
+  } finally {
+    f.unblock()
+    await Promise.allSettled(pending)
+    await f.manager.dispose()
+  }
 })
 
 test("abandoned login automatically returns headless", async () => {
@@ -906,10 +916,4 @@ test("fully unloaded shared managers allow new options after the unload grace pe
       assert.throws(() => one.attach(), /unloaded/)
     } finally { await two.dispose() }
   } finally { await one.dispose() }
-})
-
-test("all tools share one permission action and expose their operation as the resource", () => {
-  for (const name of [...pageTools, "new_page", "list_pages", "close_page", "select_page", "status", "release", "login_start", "login_finish"]) {
-    assert.deepEqual(permissionFor(name), { action: "browser_use", resources: [name] })
-  }
 })

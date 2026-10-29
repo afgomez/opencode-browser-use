@@ -128,10 +128,9 @@ not the entire browser or its parent/subagent sessions.
 The title-row **Settings** button opens a custom dialog showing mode and visibility
 choices together. Use the mouse or arrow keys/Tab and Enter to choose. The
 current mode and visibility appear beneath the title (for example, **Shared / Headless**); visibility
-is hidden in Attach mode. Mode changes require confirmation and transfer or close
-this session's owned tabs as described above. Visibility changes require confirmation and reload the
-affected browser's owned tabs: all Shared sessions, or only the Isolated
-session. Unsaved page state and snapshots are lost. Controls show a spinner
+is hidden in Attach mode. Changes require confirmation; see [Browser modes](#browser-modes)
+for tab transfers and [Headed inspection](#headed-inspection) for visibility changes.
+Controls show a spinner
 while applying a confirmed change and are disabled during login/recovery or
 when the browser state cannot be read. Changing mode or visibility while the
 browser is stopped configures future use; it never launches or attaches to Chrome.
@@ -139,7 +138,7 @@ Failed switches show an error toast. The confirmation authorizes these trusted
 client controls, which do not evaluate agent permission rules; agent tools still
 enforce those rules unchanged.
 
-The list and visibility refresh about once per second while mounted, including human title,
+The list and settings refresh about once per second while mounted, including human title,
 navigation, and close changes during headed inspection or login. Reads share
 the browser operation queue, so a long-running tool can delay an update. Failed
 reads clear stale entries, show **Browser connection unavailable; retrying…**,
@@ -164,10 +163,6 @@ or a security boundary against untrusted clients. Session IDs for this UI API co
 client, never from model-supplied browser-tool inputs. `setMode` is likewise a
 trusted-client control and must only be invoked after user confirmation.
 
-The browser state uses `visibility` consistently in RPC responses and `status`.
-Hot reload migrates the legacy in-memory field without restarting Chrome or
-discarding handles; clients should use the current `setVisibility` contract.
-
 ## Headed inspection
 
 Visibility is a user control, not an agent tool. Use the sidebar button or the
@@ -179,18 +174,17 @@ local TUI command in an open session:
 /browser-use visibility
 ```
 
-Omit the visibility value to open the same picker as the sidebar. Invalid arguments show
+Omit the visibility value to open a visibility-only picker; use `/browser-use`
+without arguments for the sidebar's combined settings dialog. Invalid arguments show
 usage rather than sending a prompt to the agent. The command works with the
 sidebar hidden and before any tabs are opened. Actual changes require the same
 confirmation as the sidebar, bypass agent permission rules, and share its busy
-state/spinner. Choosing the current visibility is a no-op.
+state/spinner.
 
 Changing visibility does not pause automation: you can watch the
-agent work in a visible window. In Shared mode every shared session's tabs are
-reloaded; in Isolated mode only that session's tabs are reloaded. Attach mode has
-no visibility control. HTTP(S) URLs, persistent cookies, and
-page handles survive; unsaved page state, navigation history, and snapshot UIDs
-do not. Always take fresh snapshots afterward. The calling session's first owned
+agent work in a visible window. It restarts the affected browser as described in
+[Restart effects](#restart-effects). Attach mode has no visibility control.
+The calling session's first owned
 tab is activated when switching to headed visibility; other sessions' tabs are never
 selected for it.
 
@@ -223,12 +217,7 @@ Get user approval before starting. Then:
 In Attach mode these calls do not restart or pause Chrome. Ask the user to log in
 manually in their own Chrome and wait for confirmation before continuing.
 
-**Restarts reload every owned HTTP(S) URL. They lose unsaved form state,
-in-memory JavaScript, sessionStorage, navigation history, and old snapshot
-UIDs.** Page handles survive a coordinated restart, but take fresh snapshots.
-Non-HTTP(S) pages return to a blank page rather than replaying scripts/files.
-Unknown tabs are not restored by the plugin. Chrome itself may restore tabs,
-but those remain unowned and invisible to the tools.
+Both login transitions have the [restart effects](#restart-effects) below.
 
 Login automatically returns headless after ten minutes; activity in Chrome
 does not extend that deadline. Only the initiating session can finish it early.
@@ -239,10 +228,20 @@ the resource. The global configuration allows routine operations but asks for
 `login_start` because it begins a disruptive shared-profile handoff. `login_finish`
 needs no additional permission prompt, but the agent must still wait for the
 human to confirm they are done. Visibility is controlled only by the user through
-the sidebar or command, not an agent tool or permission rule. Old
-`switch_mode.*` permission rules are no longer needed. Keep the login exception
+the sidebar or command, not an agent tool or permission rule. Keep the login exception
 unless you explicitly want unattended transitions. Specific rules must follow
 the broad `*` rule because the last matching rule wins.
+
+## Restart effects
+
+Visibility changes and human-login transitions restart the affected plugin-owned
+browser: all Shared sessions, or only the Isolated session.
+**Restarts reload every owned HTTP(S) URL. They lose unsaved form state,
+in-memory JavaScript, sessionStorage, navigation history, and old snapshot
+UIDs.** Persistent cookies and page handles survive a coordinated restart, but
+take fresh snapshots. Non-HTTP(S) pages return to a blank page rather than
+replaying scripts/files. Unknown tabs are not restored by the plugin. Chrome
+itself may restore tabs, but those remain unowned and invisible to the tools.
 
 ## Lifecycle and concurrency
 
@@ -304,9 +303,6 @@ paths must be absolute (`~/` is accepted). On Linux/Windows the default Chrome
 executable is the standard system installation path; override it as needed.
 The default profile is `~/.cache/opencode/browser_use/chrome-profile`, dedicated
 to this plugin rather than shared with independent Chrome DevTools MCP clients.
-The previous `~/.cache/chrome-devtools-mcp/chrome-profile` is left untouched and
-is not automatically copied or migrated. A fresh OpenCode profile requires its
-own login; authentication then persists in this new directory.
 
 The plugin's permission action is `browser_use`, not `browser`.
 OpenCode reserves `browser` for its separate desktop browser; its availability
@@ -330,6 +326,18 @@ debugging endpoint. Never use this profile for mutually untrusted agents.
 The debugging endpoint binds to loopback and uses an ephemeral port. Profile
 metadata is private to the local user. No endpoint is exposed as an OpenCode
 tool or independent configured MCP connection.
+
+## Compatibility
+
+- The registered TUI command ID remains `browser-use.visibility` for existing
+  keybindings; its title and bare `/browser-use` action open browser settings.
+- Hot reload migrates the legacy in-memory visibility field without restarting
+  Chrome or discarding handles. Clients should use the current `setVisibility`
+  RPC contract; state responses use `visibility`.
+- Old `switch_mode.*` permission rules are no longer needed.
+- The previous `~/.cache/chrome-devtools-mcp/chrome-profile` is left untouched
+  and is not automatically copied or migrated. A fresh OpenCode profile requires
+  its own login; authentication then persists in the configured profile directory.
 
 ## Development
 

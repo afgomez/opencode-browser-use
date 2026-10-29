@@ -36,6 +36,28 @@ test("sidebar polling refreshes without overlapping reads and stops on cleanup",
   } finally { stop() }
 })
 
+test("sidebar polls changed metadata and the last tab closing at the refresh interval", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  let current = snapshot
+  const updates: PagesSnapshot[] = []
+  const stop = watchPages(async () => current, (value) => updates.push(value))
+  try {
+    await settle()
+    const changed: PagesSnapshot = { ...snapshot, visibility: "headed", pages: [{ pageId: "a", title: "After", url: "https://after.test/" }] }
+    current = changed
+    t.mock.timers.tick(999)
+    await settle()
+    assert.deepEqual(updates, [snapshot])
+    t.mock.timers.tick(1)
+    await settle()
+    assert.deepEqual(updates, [snapshot, changed])
+    current = emptySnapshot()
+    t.mock.timers.tick(1000)
+    await settle()
+    assert.deepEqual(updates, [snapshot, changed, emptySnapshot()])
+  } finally { stop() }
+})
+
 test("a disconnected sidebar clears stale tabs and can recover on the next poll", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] })
   let reads = 0

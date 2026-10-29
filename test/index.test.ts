@@ -3,10 +3,17 @@ import { randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
-import plugin from "../src/index"
+import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js"
+import { createPlugin } from "../src/index"
 import { sharedManager } from "../src/manager"
 import { options } from "../src/options"
 import { BrowserUse, emptySnapshot } from "../src/rpc"
+
+const plugin = createPlugin(async (): Promise<McpTool[]> => [
+  { name: "take_snapshot", description: "Snapshot the page.", inputSchema: { type: "object", properties: { verbose: { type: "boolean" } } } },
+  { name: "click", description: "Click an element.", inputSchema: { type: "object", properties: { uid: { type: "string" }, serviceWorkerId: { type: "string" } }, required: ["uid"] } },
+  { name: "unreviewed_tool", inputSchema: { type: "object" } },
+])
 
 const storage = () => {
   const values = new Map<string, string>()
@@ -17,7 +24,7 @@ test("browser tools retain discoverable guidance without session instruction inj
   const input = { profileDirectory: join(tmpdir(), "opencode", `browser-use-catalog-${randomUUID()}`) }
   const manager = sharedManager(options(input))
   let namespace!: { name: string; description: string }
-  type Tool = { name: string; description: string; options: { namespace: string; codemode: boolean } }
+  type Tool = { name: string; description: string; input: { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean }; options: { namespace: string; codemode: boolean } }
   const tools = new Map<string, Tool>()
   const hook = t.mock.fn(async () => {})
   const ctx = {
@@ -50,6 +57,19 @@ test("browser tools retain discoverable guidance without session instruction inj
     for (const tool of tools.values()) {
       assert.deepEqual(tool.options, { namespace: "browser_use", codemode: true })
     }
+    assert.ok(!tools.has("unreviewed_tool"), "unreviewed upstream tools must not be registered")
+    for (const name of ["take_snapshot", "click"]) {
+      const tool = tools.get(name)!
+      assert.equal(tool.input.additionalProperties, false)
+      assert.deepEqual(tool.input.properties.pageId, { type: "string", description: "Session-owned page handle from browser_use_new_page or browser_use_list_pages." })
+    }
+    assert.equal(tools.get("take_snapshot")!.description, "Snapshot the page.")
+    assert.deepEqual(tools.get("take_snapshot")!.input.required, ["pageId"])
+    assert.deepEqual(tools.get("take_snapshot")!.input.properties.verbose, { type: "boolean" })
+    assert.equal(tools.get("click")!.description, "Click an element.")
+    assert.deepEqual(tools.get("click")!.input.required, ["uid", "pageId"])
+    assert.deepEqual(tools.get("click")!.input.properties.uid, { type: "string" })
+    assert.ok(!("serviceWorkerId" in tools.get("click")!.input.properties))
   } finally {
     if (cleanup) await cleanup()
     await manager.dispose()

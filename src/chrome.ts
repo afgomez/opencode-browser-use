@@ -6,7 +6,7 @@ import lockfile from "proper-lockfile"
 import { Cdp } from "./cdp"
 import type { Options } from "./options"
 
-interface Advertisement { pid: number; endpoint: string; headless: boolean }
+interface Advertisement { pid: number; endpoint: string }
 
 export interface BrowserProcess {
   url: string
@@ -124,7 +124,7 @@ export class Chrome {
       }
       if (!endpoint || !child.pid) throw new Error("Chrome did not publish its debugging endpoint")
       const cdp = await Cdp.connect(endpoint)
-      const saved: Advertisement = { pid: child.pid, endpoint, headless }
+      const saved: Advertisement = { pid: child.pid, endpoint }
       await writeFile(this.advertisement(), JSON.stringify(saved), { mode: 0o600 })
       return this.connection(saved, cdp, child)
     } catch (error) {

@@ -10,11 +10,11 @@ import { emptySnapshot, type PagesSnapshot } from "../src/rpc"
 import type { BrowserVisibility } from "../src/policy"
 import type { BrowserMode } from "../src/router"
 import { spinnerFrames } from "../src/spinner"
-import { createVisibility, VisibilityCommands, type Visibility } from "../src/visibility"
+import { createSettings, SettingsCommands, type Settings } from "../src/browser-settings"
 import { SettingsDialog } from "../src/settings"
 
 const hasSpinner = (frame: string) => spinnerFrames.some((glyph) => frame.includes(glyph))
-const hasVisibilityButton = (frame: string, visibility: "Headless" | "Headed") => frame.split("\n").some((line) => line.includes("Browser use") && line.includes("Settings")) && frame.includes(`Shared / ${visibility}`)
+const hasSettingsButton = (frame: string, visibility: "Headless" | "Headed") => frame.split("\n").some((line) => line.includes("Browser use") && line.includes("Settings")) && frame.includes(`Shared / ${visibility}`)
 const actionColor = (base: string, hovered: string, disabled: string, focused = base) => ({
   base, hovered, disabled, focused,
   state: (states: { disabled?: boolean; hovered?: boolean; focused?: boolean }) => states.disabled ? disabled : states.focused ? focused : states.hovered ? hovered : base,
@@ -67,7 +67,7 @@ test("sidebar renders title, muted URL, fallback and truncation; switching sessi
     assert.match(frame, /Browser use · 2 tabs/)
     assert.match(frame, /http:\/\/localhost:3000\/flows/)
     assert.match(frame, /Untitled/)
-    assert.ok(hasVisibilityButton(frame, "Headless"), "the visibility button belongs on the title row")
+    assert.ok(hasSettingsButton(frame, "Headless"), "the settings button belongs on the title row")
     assert.ok(!frame.includes("[ Settings ]"), "the button should not have text brackets")
     assert.ok(!frame.includes("Visibility:"))
     assert.ok(frame.includes("Shared / Headless"), "the state appears below the title")
@@ -92,27 +92,30 @@ test("sidebar renders title, muted URL, fallback and truncation; switching sessi
   assert.equal(calls.at(-1)!.signal.aborted, true)
 })
 
-test("sidebar polling updates titles/URLs and keeps settings when the last tab closes", async () => {
+test("sidebar polling updates titles/URLs and an empty session keeps settings", async () => {
+  const [session, setSession] = createSignal("a")
+  let polled: (() => void) | undefined
   let current: PagesSnapshot = { ...emptySnapshot(), pages: [{ pageId: "a", title: "Before", url: "https://before.test/" }] }
   const context = {
-    client: { rpc() { return { async pages() { return current } } } },
+    client: { rpc() { return { async pages() { polled?.(); return current } } } },
     data: { session: { get() { return { location: { directory: "/workspace" } } } } },
     theme,
   } as unknown as Context
   const ui = await testRender(() => (
     <PluginContextProvider value={context}>
-      <BrowserSidebar sessionID="a" />
+      <BrowserSidebar sessionID={session()} />
     </PluginContextProvider>
   ), { width: 40, height: 10 })
   try {
     await ui.waitForFrame((frame) => frame.includes("Before"))
     current = { ...emptySnapshot(), visibility: "headed", pages: [{ pageId: "a", title: "After", url: "https://after.test/" }] }
-    await new Promise((resolve) => setTimeout(resolve, 1100))
+    // Keep one real timer wiring check, waiting for the RPC rather than a fixed sleep.
+    await new Promise<void>((resolve) => { polled = resolve })
     const changed = await ui.waitForFrame((frame) => frame.includes("After"))
     assert.match(changed, /https:\/\/after.test\//)
     assert.ok(changed.includes("Shared / Headed"), "external visibility changes must update the state")
     current = emptySnapshot()
-    await new Promise((resolve) => setTimeout(resolve, 1100))
+    setSession("empty")
     const empty = await ui.waitForFrame((frame) => !frame.includes("After"))
     assert.ok(empty.includes("Browser use") && empty.includes("Settings"))
     assert.match(empty, /0 tabs/)
@@ -139,29 +142,31 @@ test("sidebar shows mode and applicable visibility beneath the title", async () 
 })
 
 test("an empty sidebar keeps working settings for mode and visibility changes", async () => {
-  const { f, ui, click, setSession, visibility } = await visibilityFixture()
+  const { f, ui, click, choose, setSession } = await settingsFixture()
   try {
     f.snapshot = { ...emptySnapshot(), mode: "shared" }
     setSession("empty")
     const empty = await ui.waitForFrame((frame) => frame.includes("0 tabs") && !frame.includes("Flows"))
-    assert.ok(hasVisibilityButton(empty, "Headless"))
+    assert.ok(hasSettingsButton(empty, "Headless"))
     await click("headed")
-    await ui.waitForFrame((frame) => hasVisibilityButton(frame, "Headed"))
+    await ui.waitForFrame((frame) => hasSettingsButton(frame, "Headed"))
     assert.equal(f.calls.at(-1)!.visibility, "headed")
     assert.match(ui.captureCharFrame(), /0 tabs/)
-    visibility.settings = (view, snapshot) => visibility.chooseMode(view, "isolated", snapshot)
-    await click("headed")
+    await click()
+    await choose("Isolated")
     await ui.waitForFrame((frame) => frame.includes("Isolated / Headless"))
     assert.deepEqual(f.modeCalls, ["isolated"])
     assert.match(ui.captureCharFrame(), /0 tabs/)
   } finally { await ui.dispose() }
 })
 
-async function visibilityFixture(options: { commands?: boolean; sidebar?: boolean } = {}) {
+async function settingsFixture(options: { commands?: boolean; sidebar?: boolean } = {}) {
   const [session, setSession] = createSignal("a")
+  const [dialog, setDialog] = createSignal<(() => JSX.Element) | undefined>()
+  let closed: (() => void) | undefined
   let command!: KeymapCommand
   let layer!: KeymapLayer
-  let visibility!: Visibility
+  let settings!: Settings
   const f = {
     snapshot: { ...emptySnapshot(), pages: [{ pageId: "a", title: "Flows", url: "https://a.test/" }] },
     confirmations: [] as Array<{ title: string; message: string }>,
@@ -170,8 +175,7 @@ async function visibilityFixture(options: { commands?: boolean; sidebar?: boolea
     toasts: [] as Array<{ message: string }>,
     failRead: false,
     selected: "headed" as BrowserVisibility,
-    settingsChoice: "visibility" as "visibility" | "mode" | undefined,
-    settingsOptions: [] as string[],
+    dialogs: 0,
     modeCalls: [] as BrowserMode[],
     select: async () => f.selected as BrowserVisibility | undefined,
     confirm: async () => true as boolean | undefined,
@@ -194,29 +198,24 @@ async function visibilityFixture(options: { commands?: boolean; sidebar?: boolea
     ui: {
       router: { current: (): Route => session() === "home" ? { type: "home" } : { type: "session", sessionID: session() } },
       dialog: {
-        async select(input: (typeof f.selections)[number]) { if (input.title === "Browser settings") { f.settingsOptions = input.options.map((option) => option.value); return f.settingsChoice }; f.selections.push(input); return f.select() },
+        set() {},
+        show(render: () => JSX.Element, onClose: () => void) { f.dialogs++; closed = onClose; setDialog(() => render) },
+        clear() { setDialog(undefined); const callback = closed; closed = undefined; callback?.() },
+        async select(input: (typeof f.selections)[number]) { f.selections.push(input); return f.select() },
         async confirm(input: { title: string; message: string }) { f.confirmations.push(input); return f.confirm() },
       },
       toast: { show(input: { message: string }) { f.toasts.push(input) } },
     },
   } as unknown as Context
   const ui = await testRender(() => {
-    visibility = createVisibility(context)
-    // Exercise the sidebar interaction separately from the dialog's own renderer.
-    visibility.settings = async (view, snapshot) => {
-      const choice = await context.ui.dialog.select<"mode" | "visibility">({ title: "Browser settings", options: [
-        { title: "Mode", value: "mode" }, ...(snapshot.mode === "attach" ? [] : [{ title: "Visibility", value: "visibility" as const }]),
-      ] })
-      if (view.signal.aborted) return
-      if (choice === "mode") return visibility.chooseMode(view, undefined, snapshot)
-      if (choice === "visibility") return visibility.choose(view, undefined, snapshot)
-    }
+    settings = createSettings(context)
     return <PluginContextProvider value={context}>
-      {options.commands ? <VisibilityCommands visibility={visibility} /> : null}
-      {options.sidebar === false ? null : <BrowserSidebar sessionID={session()} visibility={visibility} />}
+      {options.commands ? <SettingsCommands settings={settings} /> : null}
+      {options.sidebar === false ? null : <BrowserSidebar sessionID={session()} settings={settings} />}
+      <Show when={dialog()}>{(render) => <box position="absolute" top={0} left={0} width="100%" backgroundColor="#000000">{render()()}</box>}</Show>
     </PluginContextProvider>
-  }, { width: 45, height: 12 })
-  if (options.sidebar !== false) await ui.waitForFrame((frame) => hasVisibilityButton(frame, "Headless"))
+  }, { width: 60, height: 26 })
+  if (options.sidebar !== false) await ui.waitForFrame((frame) => hasSettingsButton(frame, "Headless"))
   else await ui.renderOnce()
   const position = () => {
     const lines = ui.captureCharFrame().split("\n")
@@ -224,17 +223,23 @@ async function visibilityFixture(options: { commands?: boolean; sidebar?: boolea
     assert.ok(y >= 0)
     return { x: lines[y].indexOf("Settings") + 1, y }
   }
-  const click = async (visibility: BrowserVisibility) => {
-    f.selected = visibility
+  const choose = async (label: string) => {
+    const frame = await ui.waitForFrame((frame) => frame.includes("Browser settings") && frame.includes(label))
+    const lines = frame.split("\n")
+    const y = lines.findIndex((line) => line.includes(label))
+    await ui.mockMouse.click(lines[y].indexOf(label) + 1, y)
+  }
+  const click = async (value?: BrowserVisibility) => {
     const { x, y } = position()
     await ui.mockMouse.click(x, y)
+    if (value) await choose(value === "headed" ? "Headed" : "Headless")
   }
   const active = () => ui.captureCharFrame().includes("Shared / Headless") ? ["headless"] : ui.captureCharFrame().includes("Shared / Headed") ? ["headed"] : []
-  return { f, ui, click, active, setSession, position, command, layer, visibility }
+  return { f, ui, click, choose, dialog, active, setSession, position, command, layer, settings }
 }
 
-test("visibility command accepts both settings without a sidebar or tabs and skips the picker", async () => {
-  const { f, ui, command, layer } = await visibilityFixture({ commands: true, sidebar: false })
+test("settings command accepts both settings without a sidebar or tabs and skips the picker", async () => {
+  const { f, ui, command, layer } = await settingsFixture({ commands: true, sidebar: false })
   try {
     assert.equal(command.id, "browser-use.visibility")
     assert.equal(command.title, "Browser use settings")
@@ -267,7 +272,8 @@ test("custom settings renders choices and selects with keyboard; User hides visi
   </PluginContextProvider>, { width: 60, height: 22 })
   try {
     const frame = await ui.waitForFrame((frame) => frame.includes("Browser settings") && frame.includes("Headless"))
-    assert.ok(frame.includes("The settings affect the current session only."))
+    assert.ok(frame.includes("Mode affects the current session only."))
+    assert.ok(frame.includes("Changing shared visibility reloads all shared sessions."))
     const sessionText = ui.captureSpans().lines.flatMap((line) => line.spans).find((span) => span.text === "current session")
     assert.ok(sessionText && (sessionText.attributes & TextAttributes.BOLD), "current session should be emphasized")
     assert.ok(frame.includes("Shared") && frame.includes("Isolated") && frame.includes("Attach") && frame.includes("Headed"))
@@ -306,26 +312,26 @@ test("custom settings applies a selection through confirmation and closes on ses
   } as unknown as Context
   const ui = await testRender(() => <PluginContextProvider value={context}><Show when={dialog()}>{(render) => render()()}</Show></PluginContextProvider>, { width: 60, height: 22 })
   try {
-    const visibility = createVisibility(context)
+    const settings = createSettings(context)
     const controller = new AbortController()
     const view = { sessionID: "a", location: { directory: "/workspace" }, signal: controller.signal }
-    const changing = visibility.settings(view, { ...emptySnapshot(), mode: "shared" })
+    const changing = settings.settings(view, { ...emptySnapshot(), mode: "shared" })
     await ui.waitForFrame((frame) => frame.includes("Headed"))
     for (let i = 0; i < 4; i++) await ui.mockInput.pressArrow("down")
     await ui.mockInput.pressEnter()
     await changing
     assert.equal(calls, 1)
     assert.equal(dialog(), undefined)
-    const dismissed = visibility.settings(view, { ...emptySnapshot(), mode: "shared" })
+    const dismissed = settings.settings(view, { ...emptySnapshot(), mode: "shared" })
     const frame = await ui.waitForFrame((frame) => frame.includes("Browser settings"))
     const lines = frame.split("\n")
     const y = lines.findIndex((line) => line.includes("esc"))
     await ui.mockMouse.click(lines[y].indexOf("esc") + 1, y)
     await dismissed
     assert.equal(dialog(), undefined)
-    assert.equal(visibility.busy(), false)
+    assert.equal(settings.busy(), false)
     assert.equal(calls, 1, "dismissal must not change settings")
-    const cancelled = visibility.settings(view, { ...emptySnapshot(), mode: "shared" })
+    const cancelled = settings.settings(view, { ...emptySnapshot(), mode: "shared" })
     await ui.waitForFrame((frame) => frame.includes("Browser settings"))
     controller.abort()
     await cancelled
@@ -335,7 +341,7 @@ test("custom settings applies a selection through confirmation and closes on ses
 })
 
 test("mode command requires confirmation, changes only the requested session, and supports no-op", async () => {
-  const { f, ui, command } = await visibilityFixture({ commands: true, sidebar: false })
+  const { f, ui, command } = await settingsFixture({ commands: true, sidebar: false })
   try {
     f.confirm = async () => false
     await command.run("mode isolated")
@@ -359,18 +365,8 @@ test("mode command requires confirmation, changes only the requested session, an
   } finally { await ui.dispose() }
 })
 
-test("browser settings hides visibility in Attach mode", async () => {
-  const { f, ui, visibility } = await visibilityFixture({ sidebar: false })
-  try {
-    f.settingsChoice = undefined
-    const controller = new AbortController()
-    await visibility.settings({ sessionID: "a", location: { directory: "/workspace/a" }, signal: controller.signal }, { ...emptySnapshot(), mode: "attach", visibility: null })
-    assert.deepEqual(f.settingsOptions, ["mode"])
-  } finally { await ui.dispose() }
-})
-
 test("visibility command without a value uses the picker and supports cancellation", async () => {
-  const { f, ui, command } = await visibilityFixture({ commands: true })
+  const { f, ui, command, setSession } = await settingsFixture({ commands: true })
   try {
     f.select = async () => undefined
     await command.run("visibility")
@@ -380,24 +376,47 @@ test("visibility command without a value uses the picker and supports cancellati
     f.confirm = async () => false
     await command.run("  visibility   ")
     assert.equal(f.selections[1].current, "headless")
+    assert.equal(f.selections[1].title, "Browser visibility")
+    assert.deepEqual(f.selections[1].options.map((option) => option.value), ["headless", "headed"])
     assert.equal(f.confirmations.length, 1)
     assert.equal(f.calls.length, 0)
     f.confirm = async () => true
     await command.run("visibility")
     assert.equal(f.calls[0].visibility, "headed")
+    let select!: (value: BrowserVisibility) => void
+    f.select = () => new Promise((resolve) => { select = resolve })
+    const pending = command.run("visibility")
+    await ui.waitFor(() => f.selections.length === 4)
+    assert.ok(!hasSpinner(ui.captureCharFrame()), "an open picker must not show a switching spinner")
+    await command.run("visibility")
+    assert.equal(f.selections.length, 4, "repeated commands cannot open multiple pickers")
+    setSession("b")
+    await ui.renderOnce()
+    select("headless")
+    await pending
+    assert.equal(f.confirmations.length, 2)
+    assert.equal(f.calls.length, 1, "a picker selection from the previous session must be ignored")
   } finally { await ui.dispose() }
 })
 
 test("bare browser-use opens session settings and reports read failures", async () => {
-  const { f, ui, command, setSession } = await visibilityFixture({ commands: true, sidebar: false })
+  const { f, ui, command, choose, setSession } = await settingsFixture({ commands: true, sidebar: false })
   try {
-    f.settingsChoice = undefined
-    await command.run()
-    assert.deepEqual(f.settingsOptions, ["mode", "visibility"])
+    const opened = command.run()
+    const frame = await ui.waitForFrame((frame) => frame.includes("Browser settings"))
+    assert.match(frame, /Mode/)
+    assert.match(frame, /Visibility/)
+    await choose("esc")
+    await opened
+    await ui.waitForFrame((frame) => !frame.includes("Browser settings"))
     assert.equal(f.toasts.length, 0)
     f.snapshot = { ...emptySnapshot(), mode: "attach", visibility: null }
-    await command.run("   ")
-    assert.deepEqual(f.settingsOptions, ["mode"])
+    const attached = command.run("   ")
+    const attachFrame = await ui.waitForFrame((frame) => frame.includes("Browser settings"))
+    assert.match(attachFrame, /◉\s+Attach/)
+    assert.doesNotMatch(attachFrame, /Visibility|Headless|Headed/)
+    await choose("esc")
+    await attached
     f.failRead = true
     await command.run()
     assert.equal(f.toasts.at(-1)!.message, "Chrome disconnected")
@@ -409,7 +428,7 @@ test("bare browser-use opens session settings and reports read failures", async 
 })
 
 test("visibility command rejects invalid arguments and home-route calls without browser effects", async () => {
-  const { f, ui, command, setSession } = await visibilityFixture({ commands: true, sidebar: false })
+  const { f, ui, command, setSession } = await settingsFixture({ commands: true, sidebar: false })
   try {
     for (const input of ["headed", "visibility visible", "visibility headed extra", "visibility headless\nanything"]) {
       await command.run(input)
@@ -426,7 +445,7 @@ test("visibility command rejects invalid arguments and home-route calls without 
 })
 
 test("command and sidebar share busy state and show only the spinner during a confirmed command switch", async () => {
-  const { f, ui, command, click, visibility } = await visibilityFixture({ commands: true })
+  const { f, ui, command, click, settings } = await settingsFixture({ commands: true })
   let confirm!: (value: boolean) => void
   let finish!: () => void
   f.confirm = () => new Promise((resolve) => { confirm = resolve })
@@ -434,9 +453,9 @@ test("command and sidebar share busy state and show only the spinner during a co
   try {
     const changing = command.run("visibility headed")
     await ui.waitFor(() => f.confirmations.length === 1)
-    assert.ok(visibility.busy())
+    assert.ok(settings.busy())
     assert.ok(!hasSpinner(ui.captureCharFrame()))
-    await click("headed")
+    await click()
     await command.run("visibility headed")
     assert.equal(f.confirmations.length, 1)
     assert.equal(f.selections.length, 0)
@@ -447,15 +466,14 @@ test("command and sidebar share busy state and show only the spinner during a co
     await changing
     await ui.waitForFrame((frame) => !hasSpinner(frame))
     assert.equal(f.calls.length, 1)
-    assert.ok(!visibility.busy())
-    await new Promise((resolve) => setTimeout(resolve, 1100))
-    await ui.waitForFrame((frame) => hasVisibilityButton(frame, "Headed"))
+    assert.ok(!settings.busy())
+    assert.equal(f.toasts.at(-1)!.message, "Browser visibility: headed")
   } finally { await ui.dispose() }
 })
 
 test("changing sessions or unmounting cancels a command waiting for confirmation", async () => {
   for (const unmount of [false, true]) {
-    const { f, ui, command, setSession, visibility } = await visibilityFixture({ commands: true, sidebar: false })
+    const { f, ui, command, setSession, settings } = await settingsFixture({ commands: true, sidebar: false })
     let confirm!: (value: boolean) => void
     f.confirm = () => new Promise((resolve) => { confirm = resolve })
     try {
@@ -466,14 +484,14 @@ test("changing sessions or unmounting cancels a command waiting for confirmation
       confirm(true)
       await changing
       assert.equal(f.calls.length, 0)
-      assert.ok(!visibility.busy())
+      assert.ok(!settings.busy())
       assert.equal(f.toasts.length, 0)
     } finally { if (!unmount) await ui.dispose() }
   }
 })
 
 test("command failures show a toast and explicit visibility settings allow restoration retries", async () => {
-  const { f, ui, command } = await visibilityFixture({ commands: true, sidebar: false })
+  const { f, ui, command } = await settingsFixture({ commands: true, sidebar: false })
   try {
     f.failRead = true
     await command.run("visibility headed")
@@ -493,18 +511,21 @@ test("command failures show a toast and explicit visibility settings allow resto
 })
 
 test("visibility controls highlight the current value and confirm clicks before switching either direction", async () => {
-  const { f, ui, click, active } = await visibilityFixture()
+  const { f, ui, click, choose, active } = await settingsFixture()
   try {
     assert.deepEqual(active(), ["headless"])
-    await click("headless")
+    await click()
+    const frame = await ui.waitForFrame((frame) => frame.includes("Browser settings"))
+    assert.match(frame, /◉\s+Headless/)
+    assert.match(frame, /◯\s+Headed/)
+    await choose("Headless")
+    await ui.waitForFrame((frame) => !frame.includes("Browser settings"))
     assert.equal(f.confirmations.length, 0, "choosing the current visibility is a no-op")
-    assert.equal(f.selections[0].current, "headless")
-    assert.deepEqual(f.selections[0].options.map((option) => option.value), ["headless", "headed"])
     for (const visibility of ["headed", "headless"] as const) {
       await click(visibility)
-      await ui.waitForFrame((frame) => hasVisibilityButton(frame, visibility === "headed" ? "Headed" : "Headless") && !hasSpinner(frame))
+      await ui.waitForFrame((frame) => hasSettingsButton(frame, visibility === "headed" ? "Headed" : "Headless") && !hasSpinner(frame))
       assert.equal(f.calls.at(-1)!.visibility, visibility)
-      assert.equal(f.selections.at(-1)!.title, "Browser visibility")
+      assert.equal(f.selections.length, 0, "sidebar settings bypass the native picker")
       assert.deepEqual(f.calls.at(-1)!.location, { directory: "/workspace/a" })
       assert.equal(f.calls.at(-1)!.sessionID, "a")
       assert.match(f.confirmations.at(-1)!.message, /every session's tabs/)
@@ -514,8 +535,8 @@ test("visibility controls highlight the current value and confirm clicks before 
   } finally { await ui.dispose() }
 })
 
-test("the opening click finishes before showing the confirmation and leaves it pending for user input", async () => {
-  const { f, ui, position } = await visibilityFixture()
+test("the opening click finishes before showing settings and selection leaves confirmation pending", async () => {
+  const { f, ui, position, choose, dialog } = await settingsFixture()
   let confirm!: (value: boolean) => void
   f.confirm = () => new Promise((resolve) => { confirm = resolve })
   try {
@@ -523,8 +544,12 @@ test("the opening click finishes before showing the confirmation and leaves it p
     await ui.mockMouse.pressDown(x, y)
     await ui.renderOnce()
     assert.equal(f.confirmations.length, 0, "opening on mouse-down exposes the dialog to the same click's release")
-    assert.equal(f.selections.length, 0)
+    assert.equal(dialog(), undefined)
     await ui.mockMouse.release(x, y)
+    await ui.waitForFrame((frame) => frame.includes("Browser settings"))
+    assert.equal(f.confirmations.length, 0, "opening settings must not select a choice")
+    assert.equal(f.calls.length, 0)
+    await choose("Headed")
     await ui.waitFor(() => f.confirmations.length === 1)
     assert.equal(f.confirmations.length, 1)
     assert.equal(f.calls.length, 0)
@@ -539,11 +564,11 @@ test("the opening click finishes before showing the confirmation and leaves it p
 })
 
 test("visibility controls handle cancellation, failed switches, and repeated clicks while busy", async () => {
-  const { f, ui, click, active, position } = await visibilityFixture()
+  const { f, ui, click, active, position } = await settingsFixture()
   try {
     f.confirm = async () => false
     await click("headed")
-    await ui.waitForFrame((frame) => !hasSpinner(frame))
+    await ui.waitForFrame((frame) => hasSettingsButton(frame, "Headless") && !frame.includes("Browser settings") && !hasSpinner(frame))
     assert.equal(f.calls.length, 0)
     assert.deepEqual(active(), ["headless"])
     f.confirm = async () => true
@@ -562,34 +587,31 @@ test("visibility controls handle cancellation, failed switches, and repeated cli
   } finally { await ui.dispose() }
 })
 
-test("cancelling the native picker or changing sessions while it is open never changes visibility", async () => {
-  const { f, ui, click, setSession, active } = await visibilityFixture()
+test("dismissing settings or changing sessions while open never changes visibility", async () => {
+  const { f, ui, click, choose, dialog, setSession, active, settings } = await settingsFixture()
   try {
-    f.select = async () => undefined
-    await click("headed")
-    await ui.waitForFrame((frame) => !hasSpinner(frame))
+    await click()
+    await choose("esc")
+    await ui.waitForFrame((frame) => !frame.includes("Browser settings"))
     assert.equal(f.confirmations.length, 0)
     assert.equal(f.calls.length, 0)
     assert.deepEqual(active(), ["headless"])
-    let select!: (value: BrowserVisibility) => void
-    f.select = () => new Promise((resolve) => { select = resolve })
-    await click("headed")
-    await ui.waitFor(() => f.selections.length === 2)
-    await ui.renderOnce()
-    assert.ok(!hasSpinner(ui.captureCharFrame()), "an open picker must not show a switching spinner")
-    await click("headed")
-    assert.equal(f.selections.length, 2, "repeated clicks cannot open multiple pickers")
+    await click()
+    await ui.waitForFrame((frame) => frame.includes("Browser settings"))
+    assert.ok(!hasSpinner(ui.captureCharFrame()), "open settings must not show a switching spinner")
+    assert.ok(settings.busy())
+    assert.equal(f.dialogs, 2)
     setSession("b")
-    await ui.waitForFrame((frame) => !hasSpinner(frame))
-    select("headed")
-    await ui.renderOnce()
+    await ui.waitForFrame((frame) => !frame.includes("Browser settings"))
+    assert.equal(dialog(), undefined)
+    assert.ok(!settings.busy())
     assert.equal(f.confirmations.length, 0)
     assert.equal(f.calls.length, 0)
   } finally { await ui.dispose() }
 })
 
 test("paused browsers cannot change visibility and a session switch cancels an open confirmation", async () => {
-  const { f, ui, click, setSession } = await visibilityFixture()
+  const { f, ui, click, setSession } = await settingsFixture()
   try {
     f.snapshot = { ...f.snapshot, paused: true }
     setSession("paused")
@@ -597,13 +619,13 @@ test("paused browsers cannot change visibility and a session switch cancels an o
     const disabled = ui.captureSpans().lines.flatMap((line) => line.spans).find((span) => span.text.trim() === "Settings")!
     assert.ok(disabled.bg.equals(RGBA.fromHex("#00000000")))
     assert.ok(disabled.fg.equals(RGBA.fromHex(theme.text.action.secondary.disabled)))
-    await click("headed")
+    await click()
     assert.equal(f.confirmations.length, 0)
-    assert.equal(f.selections.length, 0)
+    assert.equal(f.dialogs, 0)
     assert.equal(f.calls.length, 0)
     f.snapshot = { ...f.snapshot, paused: false }
     setSession("a")
-    await ui.waitForFrame((frame) => hasVisibilityButton(frame, "Headless") && !frame.includes("paused"))
+    await ui.waitForFrame((frame) => hasSettingsButton(frame, "Headless") && !frame.includes("paused"))
     let confirm!: (value: boolean) => void
     f.confirm = () => new Promise((resolve) => { confirm = resolve })
     await click("headed")
@@ -617,7 +639,7 @@ test("paused browsers cannot change visibility and a session switch cancels an o
 })
 
 test("a spinner animates only while the confirmed visibility change is actually running", async () => {
-  const { f, ui, click } = await visibilityFixture()
+  const { f, ui, click } = await settingsFixture()
   let finish!: () => void
   f.change = (visibility) => new Promise<void>((resolve) => {
     finish = () => { f.snapshot = { ...f.snapshot, visibility }; resolve() }
@@ -634,7 +656,7 @@ test("a spinner animates only while the confirmed visibility change is actually 
     assert.ok(hasSpinner(animated))
     assert.notEqual(animated, first, "spinner frames must advance")
     finish()
-    await ui.waitForFrame((frame) => hasVisibilityButton(frame, "Headed") && !hasSpinner(frame))
+    await ui.waitForFrame((frame) => hasSettingsButton(frame, "Headed") && !hasSpinner(frame))
     await new Promise((resolve) => setTimeout(resolve, 100))
     await ui.renderOnce()
     assert.ok(!hasSpinner(ui.captureCharFrame()))
@@ -642,7 +664,7 @@ test("a spinner animates only while the confirmed visibility change is actually 
 })
 
 test("failed metadata reads retain a disabled Settings button and clear stale metadata", async () => {
-  const { f, ui, setSession, click } = await visibilityFixture()
+  const { f, ui, setSession, click } = await settingsFixture()
   try {
     f.failRead = true
     setSession("disconnected")
@@ -651,21 +673,21 @@ test("failed metadata reads retain a disabled Settings button and clear stale me
     assert.match(unavailable, /Settings/)
     const disabled = ui.captureSpans().lines.flatMap((line) => line.spans).find((span) => span.text.trim() === "Settings")!
     assert.ok(disabled.bg.equals(RGBA.fromHex("#00000000")))
-    await click("headed")
-    assert.equal(f.selections.length, 0, "settings cannot open with unknown state")
+    await click()
+    assert.equal(f.dialogs, 0, "settings cannot open with unknown state")
     assert.equal(f.calls.length, 0)
-    assert.ok(!hasVisibilityButton(unavailable, "Headless"), "unknown visibility must not be shown")
+    assert.ok(!hasSettingsButton(unavailable, "Headless"), "unknown visibility must not be shown")
     assert.ok(!unavailable.includes("Flows"), "stale tab metadata must not remain visible")
     f.failRead = false
     setSession("a")
-    const recovered = await ui.waitForFrame((frame) => hasVisibilityButton(frame, "Headless"))
+    const recovered = await ui.waitForFrame((frame) => hasSettingsButton(frame, "Headless"))
     assert.match(recovered, /Flows/)
     assert.ok(!recovered.includes("unavailable"))
   } finally { await ui.dispose() }
 })
 
-test("the visibility button stays on the title row in a narrow sidebar and its padding is clickable", async () => {
-  const { f, ui, position } = await visibilityFixture()
+test("the settings button stays on the title row in a narrow sidebar and its padding is clickable", async () => {
+  const { f, ui, position } = await settingsFixture()
   try {
     ui.resize(26, 12)
     const frame = await ui.waitForFrame((frame) => frame.includes("Headless"))
@@ -673,13 +695,15 @@ test("the visibility button stays on the title row in a narrow sidebar and its p
     assert.equal(frame.split("\n").findIndex((line) => line.includes("Settings")), frame.split("\n").findIndex((line) => line.trim().length > 0), "the button must not wrap below the title")
     const { x, y } = position()
     await ui.mockMouse.click(x - 2, y)
-    await ui.waitFor(() => f.selections.length === 1)
-    assert.equal(f.selections[0].current, "headless")
+    await ui.waitFor(() => f.dialogs === 1)
+    ui.resize(60, 26)
+    const settings = await ui.waitForFrame((frame) => frame.includes("Browser settings"))
+    assert.match(settings, /◉\s+Headless/)
   } finally { await ui.dispose() }
 })
 
-test("the visibility button highlights on hover without opening the picker", async () => {
-  const { f, ui, position } = await visibilityFixture()
+test("the settings button highlights on hover without opening settings", async () => {
+  const { f, ui, position } = await settingsFixture()
   try {
     const background = () => ui.captureSpans().lines.flatMap((line) => line.spans).find((span) => span.text.trim() === "Settings")!.bg
     const before = background()
@@ -691,7 +715,7 @@ test("the visibility button highlights on hover without opening the picker", asy
     await ui.renderOnce()
     assert.notDeepEqual(background(), before)
     assert.ok(background().equals(RGBA.fromHex(theme.background.action.secondary.hovered)))
-    assert.equal(f.selections.length, 0)
+    assert.equal(f.dialogs, 0)
     await ui.mockMouse.moveTo(0, 0)
     await ui.renderOnce()
     assert.deepEqual(background(), before)

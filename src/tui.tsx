@@ -3,21 +3,21 @@ import { createEffect, createSignal, For, onCleanup, Show } from "solid-js"
 import { BrowserUse, emptySnapshot, type PagesSnapshot } from "./rpc"
 import { singleLine, watchPages } from "./sidebar"
 import { Spinner } from "./spinner"
-import { createVisibility, VisibilityCommands, type Visibility, type VisibilityView } from "./visibility"
+import { createSettings, SettingsCommands, type Settings, type SettingsView } from "./browser-settings"
 
-export function BrowserSidebar(props: { sessionID: string; visibility?: Visibility }) {
+export function BrowserSidebar(props: { sessionID: string; settings?: Settings }) {
   const context = usePlugin()
   const browser = context.client.rpc(BrowserUse)
   const [snapshot, setSnapshot] = createSignal<PagesSnapshot>(emptySnapshot())
-  const visibility = props.visibility ?? createVisibility(context)
-  const busy = visibility.busy
-  const switching = () => visibility.switching(props.sessionID)
+  const settings = props.settings ?? createSettings(context)
+  const busy = settings.busy
+  const switching = () => settings.switching(props.sessionID)
   const [unavailable, setUnavailable] = createSignal(false)
-  const [visibilityHovered, setVisibilityHovered] = createSignal(false)
-  const visibilityButtonState = () => ({ disabled: unavailable() || busy() || snapshot().paused, hovered: visibilityHovered() })
-  const visibilityButtonBackground = () => context.theme.background.action.secondary.state(visibilityButtonState())
-  const visibilityButtonText = () => context.theme.text.action.secondary.state(visibilityButtonState())
-  let view: VisibilityView | undefined
+  const [settingsHovered, setSettingsHovered] = createSignal(false)
+  const settingsButtonState = () => ({ disabled: unavailable() || busy() || snapshot().paused, hovered: settingsHovered() })
+  const settingsButtonBackground = () => context.theme.background.action.secondary.state(settingsButtonState())
+  const settingsButtonText = () => context.theme.text.action.secondary.state(settingsButtonState())
+  let view: SettingsView | undefined
   createEffect(() => {
     const sessionID = props.sessionID
     const location = context.data.session.get(sessionID)?.location ?? context.location ?? context.data.location.default()
@@ -34,10 +34,10 @@ export function BrowserSidebar(props: { sessionID: string; visibility?: Visibili
     onCleanup(() => { controller.abort(); stop() })
   })
 
-  async function chooseVisibility() {
+  async function chooseSettings() {
     const current = view
     if (!current || current.signal.aborted || unavailable() || busy() || snapshot().paused) return
-    const updated = await visibility.settings(current, snapshot())
+    const updated = await settings.settings(current, snapshot())
     if (updated && !current.signal.aborted) setSnapshot(updated)
   }
   return (
@@ -50,14 +50,14 @@ export function BrowserSidebar(props: { sessionID: string; visibility?: Visibili
           <box flexDirection="row" flexShrink={0}>
             <Show when={switching()} fallback={<>
               <box
-                backgroundColor={visibilityButtonBackground()}
+                backgroundColor={settingsButtonBackground()}
                 paddingLeft={1} paddingRight={1} height={1} flexShrink={0}
-                onMouseOver={() => setVisibilityHovered(true)}
-                onMouseOut={() => setVisibilityHovered(false)}
+                onMouseOver={() => setSettingsHovered(true)}
+                onMouseOut={() => setSettingsHovered(false)}
                 // Open after release, so the opening click cannot dismiss the dialog.
-                onMouseUp={(event) => { if (event.button === 0) { event.stopPropagation(); void chooseVisibility() } }}
+                onMouseUp={(event) => { if (event.button === 0) { event.stopPropagation(); void chooseSettings() } }}
               >
-                <text fg={visibilityButtonText()}>
+                <text fg={settingsButtonText()}>
                   <strong>Settings</strong>
                 </text>
               </box>
@@ -90,14 +90,14 @@ export function BrowserSidebar(props: { sessionID: string; visibility?: Visibili
 export default Plugin.define({
   id: "browser-use",
   setup(context) {
-    const visibility = createVisibility(context)
+    const settings = createSettings(context)
     const commands = context.ui.slot({
       append: "app",
-      render: () => <VisibilityCommands visibility={visibility} />,
+      render: () => <SettingsCommands settings={settings} />,
     })
     const sidebar = context.ui.slot({
       append: "sidebar.content",
-      render: (input) => <BrowserSidebar sessionID={input.sessionID} visibility={visibility} />,
+      render: (input) => <BrowserSidebar sessionID={input.sessionID} settings={settings} />,
     })
     return () => { commands(); sidebar() }
   },

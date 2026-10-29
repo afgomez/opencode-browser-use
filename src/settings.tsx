@@ -38,7 +38,7 @@ export function SettingsDialog(props: { snapshot: PagesSnapshot; choose: (choice
       onMouseUp={(event) => { if (event.button === 0) { event.stopPropagation(); props.choose(item.choice) } }}
     >
       <text fg={index() === position() ? context.theme.text.action.primary.state({ focused: true }) : context.theme.text.base}>
-        {item.choice.kind === "mode" ? (props.snapshot.mode ?? "shared") === item.choice.value ? "  ◉  " : "  ◯  " : props.snapshot.visibility === item.choice.value ? "  ◉  " : "  ◯  "}{item.title}
+        {item.choice.kind === "mode" ? props.snapshot.mode === item.choice.value ? "  ◉  " : "  ◯  " : props.snapshot.visibility === item.choice.value ? "  ◉  " : "  ◯  "}{item.title}
       </text>
     </box>
   )
@@ -50,7 +50,7 @@ export function SettingsDialog(props: { snapshot: PagesSnapshot; choose: (choice
       </box>
     </box>
     <box flexDirection="column">
-      <text fg={context.theme.text.muted}>The settings affect the <strong>current session</strong> only.</text>
+      <text fg={context.theme.text.muted}>Mode affects the <strong>current session</strong> only.</text>
     </box>
     <box flexDirection="column">
       <text fg={context.theme.background.action.primary.state({ focused: true })}><strong>Mode</strong></text>
@@ -61,6 +61,9 @@ export function SettingsDialog(props: { snapshot: PagesSnapshot; choose: (choice
           <box height={1} />
           <text fg={context.theme.background.action.primary.state({ focused: true })}><strong>Visibility</strong></text>
           <text fg={context.theme.text.muted}>Choose whether Chrome is visible.</text>
+          <Show when={props.snapshot.mode === "shared"}>
+            <text fg={context.theme.text.muted}>Changing shared visibility reloads all shared sessions.</text>
+          </Show>
           <box height={1} />
           <For each={visibility}>{(item, i) => row(item, () => modes.length + i())}</For>
       </Show>

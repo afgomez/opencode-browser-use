@@ -7,20 +7,40 @@ import { BrowserUse, type PagesSnapshot } from "./rpc"
 import { SettingsDialog, type SettingsChoice } from "./settings"
 import { createComponent } from "solid-js"
 
-export interface VisibilityView { sessionID: string; location: Context["location"]; signal: AbortSignal }
+export interface SettingsView { sessionID: string; location: Context["location"]; signal: AbortSignal }
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : typeof error === "object" && error !== null && "message" in error ? String(error.message) : fallback
+}
 
 /** One user interaction shared by the command and sidebar, never an agent tool. */
-export function createVisibility(context: Context) {
+export function createSettings(context: Context) {
   const browser = context.client.rpc(BrowserUse)
-  const [operation, setOperation] = createSignal<{ view: VisibilityView; switching: boolean }>()
+  const [operation, setOperation] = createSignal<{ view: SettingsView; switching: boolean }>()
+  function begin(view: SettingsView) {
+    if (view.signal.aborted || operation()) return
+    let state = { view, switching: false }
+    const finish = () => {
+      view.signal.removeEventListener("abort", finish)
+      if (operation() === state) setOperation(undefined)
+    }
+    setOperation(state)
+    view.signal.addEventListener("abort", finish, { once: true })
+    return {
+      finish,
+      switching() {
+        if (operation() !== state) return
+        state = { view, switching: true }
+        setOperation(state)
+      },
+    }
+  }
   return {
     busy: () => !!operation(),
     switching: (sessionID: string) => operation()?.view.sessionID === sessionID && !!operation()?.switching,
-    async settings(view: VisibilityView, snapshot: PagesSnapshot) {
-      if (view.signal.aborted || operation()) return
-      setOperation({ view, switching: false })
-      const cancel = () => { if (operation()?.view === view) setOperation(undefined) }
-      view.signal.addEventListener("abort", cancel, { once: true })
+    async settings(view: SettingsView, snapshot: PagesSnapshot) {
+      const active = begin(view)
+      if (!active) return
       let selection: SettingsChoice | undefined
       try {
         selection = await new Promise<SettingsChoice | undefined>((resolve) => {
@@ -31,22 +51,21 @@ export function createVisibility(context: Context) {
           context.ui.dialog.set({ size: "large", centered: true })
           context.ui.dialog.show(() => createComponent(SettingsDialog, { snapshot, choose: (choice) => { finish(choice); context.ui.dialog.clear() } }), () => finish())
         })
-      } finally { view.signal.removeEventListener("abort", cancel); cancel() }
+      } finally { active.finish() }
       if (view.signal.aborted) return
       if (selection?.kind === "mode") return this.chooseMode(view, selection.value, snapshot)
-      if (selection?.kind === "visibility") return this.choose(view, selection.value, snapshot)
+      if (selection?.kind === "visibility") return this.chooseVisibility(view, selection.value, snapshot)
     },
-    async chooseMode(view: VisibilityView, requested?: BrowserMode, initial?: PagesSnapshot) {
-      if (view.signal.aborted || operation()) return
-      const cancel = () => { if (operation()?.view === view) setOperation(undefined) }
-      setOperation({ view, switching: false })
-      view.signal.addEventListener("abort", cancel, { once: true })
+    async chooseMode(view: SettingsView, requested?: BrowserMode, initial?: PagesSnapshot) {
+      const active = begin(view)
+      if (!active) return
       try {
         const options = { location: view.location, signal: view.signal }
         const snapshot = initial ?? await browser.pages({ sessionID: view.sessionID }, options) as PagesSnapshot
+        if (view.signal.aborted) return
         if (snapshot.paused) throw new Error("Finish the browser login or recovery before switching mode")
         const mode = requested ?? await context.ui.dialog.select<BrowserMode>({
-          title: "Browser mode", current: snapshot.mode ?? "shared",
+          title: "Browser mode", current: snapshot.mode,
           options: [
             { title: "Shared", value: "shared", description: "Plugin Chrome and profile shared across sessions" },
             { title: "Isolated", value: "isolated", description: "Private persistent Chrome profile for this session" },
@@ -54,7 +73,7 @@ export function createVisibility(context: Context) {
           ],
         })
         if (!mode || view.signal.aborted) return
-        if (mode === (snapshot.mode ?? "shared")) return snapshot
+        if (mode === snapshot.mode) return snapshot
         const message = [
           ...(mode === "attach" || snapshot.mode === "attach"
             ? ["This closes all browser tabs owned by this session. Their contents and handles will not be restored."]
@@ -64,21 +83,19 @@ export function createVisibility(context: Context) {
         ].join("\n\n")
         const approved = await context.ui.dialog.confirm({ title: `Switch browser mode to ${mode}?`, message, label: { confirm: "Switch", cancel: "Cancel" } })
         if (!approved || view.signal.aborted) return
-        setOperation({ view, switching: true })
+        active.switching()
         await browser.setMode({ sessionID: view.sessionID, mode }, options)
-        return await browser.pages({ sessionID: view.sessionID }, options) as PagesSnapshot
+        const updated = await browser.pages({ sessionID: view.sessionID }, options) as PagesSnapshot
+        if (!view.signal.aborted) return updated
       } catch (error) {
-        if (!view.signal.aborted) context.ui.toast.show({ title: "Browser mode change failed", variant: "error", message: error instanceof Error ? error.message : "Could not change browser mode." })
+        if (!view.signal.aborted) context.ui.toast.show({ title: "Browser mode change failed", variant: "error", message: errorMessage(error, "Could not change browser mode.") })
       } finally {
-        view.signal.removeEventListener("abort", cancel)
-        cancel()
+        active.finish()
       }
     },
-    async choose(view: VisibilityView, requested?: BrowserVisibility, initial?: PagesSnapshot) {
-      if (view.signal.aborted || operation()) return
-      const cancel = () => { if (operation()?.view === view) setOperation(undefined) }
-      setOperation({ view, switching: false })
-      view.signal.addEventListener("abort", cancel, { once: true })
+    async chooseVisibility(view: SettingsView, requested?: BrowserVisibility, initial?: PagesSnapshot) {
+      const active = begin(view)
+      if (!active) return
       try {
         const options = { location: view.location, signal: view.signal }
         const snapshot = initial ?? await browser.pages({ sessionID: view.sessionID }, options) as PagesSnapshot
@@ -103,29 +120,28 @@ export function createVisibility(context: Context) {
           label: { confirm: "Switch", cancel: "Cancel" },
         })
         if (!approved || view.signal.aborted) return
-        setOperation({ view, switching: true })
+        active.switching()
         await browser.setVisibility({ sessionID: view.sessionID, visibility }, options)
         const updated = await browser.pages({ sessionID: view.sessionID }, options) as PagesSnapshot
         if (!view.signal.aborted) return updated
       } catch (error) {
         if (!view.signal.aborted) context.ui.toast.show({
           title: "Browser visibility change failed", variant: "error",
-          message: error instanceof Error ? error.message : typeof error === "object" && error !== null && "message" in error ? String(error.message) : "Could not change Chrome visibility.",
+          message: errorMessage(error, "Could not change Chrome visibility."),
         })
       } finally {
-        view.signal.removeEventListener("abort", cancel)
-        cancel()
+        active.finish()
       }
     },
   }
 }
 
-export type Visibility = ReturnType<typeof createVisibility>
+export type Settings = ReturnType<typeof createSettings>
 
 /** App-scoped so the command works even with the sidebar hidden or no open tabs. */
-export function VisibilityCommands(props: { visibility: Visibility }) {
+export function SettingsCommands(props: { settings: Settings }) {
   const context = usePlugin()
-  let view: VisibilityView | undefined
+  let view: SettingsView | undefined
   createEffect(() => {
     const route = context.ui.router.current()
     const controller = new AbortController()
@@ -139,7 +155,7 @@ export function VisibilityCommands(props: { visibility: Visibility }) {
   context.keymap.layer(() => ({
     mode: "global",
     commands: [{
-      id: "browser-use.visibility",
+      id: "browser-use.visibility", // Retained for existing command/keybinding compatibility.
       title: "Browser use settings",
       description: "Change browser mode or visibility for this session",
       slash: { name: "browser-use", arguments: true },
@@ -153,9 +169,9 @@ export function VisibilityCommands(props: { visibility: Visibility }) {
           }
           try {
             const snapshot = await context.client.rpc(BrowserUse).pages({ sessionID: current.sessionID }, { location: current.location, signal: current.signal }) as PagesSnapshot
-            if (!current.signal.aborted) await props.visibility.settings(current, snapshot)
+            if (!current.signal.aborted) await props.settings.settings(current, snapshot)
           } catch (error) {
-            if (!current.signal.aborted) context.ui.toast.show({ title: "Browser settings unavailable", variant: "error", message: error instanceof Error ? error.message : "Could not load browser settings." })
+            if (!current.signal.aborted) context.ui.toast.show({ title: "Browser settings unavailable", variant: "error", message: errorMessage(error, "Could not load browser settings.") })
           }
           return
         }
@@ -165,11 +181,11 @@ export function VisibilityCommands(props: { visibility: Visibility }) {
           return
         }
         if (!current || current.signal.aborted) {
-          context.ui.toast.show({ message: "Open a session before changing browser visibility.", variant: "error" })
+          context.ui.toast.show({ message: "Open a session before changing browser settings.", variant: "error" })
           return
         }
-        const snapshot = args[0] === "mode" ? await props.visibility.chooseMode(current, args[1] as BrowserMode | undefined) : await props.visibility.choose(current, args[1] as BrowserVisibility | undefined)
-        if (snapshot && !current.signal.aborted) context.ui.toast.show({ message: args[0] === "mode" ? `Browser mode: ${snapshot.mode ?? "shared"}` : `Browser visibility: ${snapshot.visibility}`, variant: "success" })
+        const snapshot = args[0] === "mode" ? await props.settings.chooseMode(current, args[1] as BrowserMode | undefined) : await props.settings.chooseVisibility(current, args[1] as BrowserVisibility | undefined)
+        if (snapshot && !current.signal.aborted) context.ui.toast.show({ message: args[0] === "mode" ? `Browser mode: ${snapshot.mode}` : `Browser visibility: ${snapshot.visibility}`, variant: "success" })
       },
     }],
   }))

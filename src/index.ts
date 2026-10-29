@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin"
 import { loadCatalog } from "./mcp"
 import { BrowserRouter } from "./router"
 import { options } from "./options"
-import { permissionFor, wrappedCatalog } from "./policy"
+import { wrappedCatalog } from "./policy"
 import { BrowserUse } from "./rpc"
 
 const object = (properties: Record<string, unknown> = {}, required: string[] = []) => ({
@@ -20,11 +20,11 @@ const controls = [
   { name: "login_finish", description: "After the human confirms login, resume headless browsing in Shared or Isolated mode. Tabs reload; take fresh snapshots. In Attach mode this gives manual-login guidance without restarting Chrome.", input: object() },
 ]
 
-export default Plugin.define({
+export const createPlugin = (catalogLoader: typeof loadCatalog = loadCatalog) => Plugin.define({
   id: "browser-use",
   async setup(ctx) {
     const config = options(ctx.options)
-    const catalog = wrappedCatalog(await loadCatalog(config.nodePath))
+    const catalog = wrappedCatalog(await catalogLoader(config.nodePath))
     const manager = new BrowserRouter(config, ctx.storage)
     const detach = () => manager.detach()
     const events = new AbortController()
@@ -69,7 +69,7 @@ export default Plugin.define({
               await ctx.permission.assert({
                 sessionID: context.sessionID, agent: context.agent,
                 source: { type: "tool", messageID: context.messageID, id: context.id },
-                ...permissionFor(tool.name),
+                action: "browser_use", resources: [tool.name],
                 metadata: tool.name.startsWith("login_")
                   ? { warning: "Shared mode restarts Chrome and reloads all shared sessions' tabs; isolated mode affects only this session. Attach mode requires manual login." }
                   : {},
@@ -97,3 +97,5 @@ export default Plugin.define({
     return () => { events.abort(); detach() }
   },
 })
+
+export default createPlugin()

@@ -8,12 +8,22 @@ import { AttachChrome } from "./attach-chrome"
 import { Chrome } from "./chrome"
 import { connectMcp } from "./mcp"
 import type { PublicPage } from "./policy"
+import type { PagesSnapshot } from "./rpc"
 
 export type BrowserMode = "shared" | "isolated" | "attach"
 export function browserMode(value: unknown): BrowserMode {
   if (value === "shared" || value === "isolated" || value === "attach") return value
   throw new Error("Browser mode must be shared, isolated, or attach")
 }
+
+// Compatibility boundary for persisted choices and managers surviving hot reloads.
+// Normalize reads without writing a migration; keep the registry identity so live
+// attached tabs remain owned by the same manager until the process exits.
+function savedBrowserMode(value: unknown): BrowserMode {
+  return value === undefined ? "shared" : value === "user" ? "attach" : browserMode(value)
+}
+function attachedManagerKey(profileDirectory: string) { return `${profileDirectory}:user` }
+
 type Storage = { get(key: string): Promise<unknown>; set(key: string, value: string): Promise<void>; remove(key: string): Promise<void>; scan?(options: { prefix: string; after?: string; limit?: number }): Promise<{ entries: readonly { key: string; value: unknown }[]; next?: string }> }
 type Transfer = { source: BrowserManager; destination: BrowserManager; old: BrowserMode; mode: BrowserMode; phase: "preparing" | "persisting" | "rollingBack"; pages?: PublicPage[] }
 type Registry = { queues: Map<string, Serial>; managers: Map<string, BrowserManager>; transfers: Map<string, Transfer> }
@@ -43,6 +53,15 @@ export class BrowserRouter {
   private key(sessionID: string) { return `browser-mode.${hash(sessionID)}` }
   private deletionKey(sessionID: string) { return `browser-deletion.${hash(sessionID)}` }
   private transferKey(sessionID: string) { return `${this.config.profileDirectory}:${sessionID}` }
+  /** Finalize only after the caller has successfully cleaned up transfer tabs. */
+  private completeTransfer(sessionID: string) {
+    const key = this.transferKey(sessionID)
+    const transfer = registry.transfers.get(key)
+    if (!transfer) return
+    registry.transfers.delete(key)
+    transfer.source.unpinTransfer(sessionID)
+    transfer.destination.unpinTransfer(sessionID)
+  }
   private async recoverTransfer(sessionID: string) {
     const key = this.transferKey(sessionID)
     const transfer = registry.transfers.get(key)
@@ -82,9 +101,7 @@ export class BrowserRouter {
       }
     }
     await (mode === transfer.old ? transfer.destination : transfer.source).releaseSession(sessionID)
-    registry.transfers.delete(this.transferKey(sessionID))
-    transfer.source.unpinTransfer(sessionID)
-    transfer.destination.unpinTransfer(sessionID)
+    this.completeTransfer(sessionID)
   }
   private profile(sessionID: string) { return join(`${this.config.profileDirectory}-isolated`, hash(sessionID)) }
   private queue(sessionID: string) {
@@ -99,12 +116,11 @@ export class BrowserRouter {
   private async mode(sessionID: string): Promise<BrowserMode> {
     if (await this.storage.get(this.deletionKey(sessionID)) !== undefined) throw new Error("Browser session deletion is pending cleanup")
     const value = await this.storage.get(this.key(sessionID))
-    return value === undefined ? "shared" : value === "user" ? "attach" : browserMode(value)
+    return savedBrowserMode(value)
   }
   private manager(mode: BrowserMode, sessionID: string) {
     if (mode === "shared") return this.shared
-    // Keep the legacy registry key so hot reloads retain existing attached tabs.
-    const key = mode === "attach" ? `${this.config.profileDirectory}:user` : this.profile(sessionID)
+    const key = mode === "attach" ? attachedManagerKey(this.config.profileDirectory) : this.profile(sessionID)
     let manager = registry.managers.get(key)
     if (!manager || manager.isRetired) {
       manager = mode === "attach"
@@ -137,7 +153,7 @@ export class BrowserRouter {
       return result
     }, caller.signal)
   }
-  async inspectPages(sessionID: string, signal?: AbortSignal) {
+  async inspectPages(sessionID: string, signal?: AbortSignal): Promise<PagesSnapshot> {
     return this.queue(sessionID).run(async () => {
       await this.recoverTransfer(sessionID)
       const mode = await this.mode(sessionID)
@@ -176,9 +192,7 @@ export class BrowserRouter {
           await this.storage.set(this.key(sessionID), mode)
           await destination.validateTransfer(sessionID, state.pages)
           await manager.releaseSession(sessionID)
-          registry.transfers.delete(key)
-          manager.unpinTransfer(sessionID)
-          destination.unpinTransfer(sessionID)
+          this.completeTransfer(sessionID)
         } catch (error) {
           try { await this.recoverTransferLocked(sessionID, transfer) } catch (cleanup) {
             throw new AggregateError([error, cleanup], "Browser mode switch incomplete; owned tabs are retained and cleanup will be retried")
@@ -197,7 +211,7 @@ export class BrowserRouter {
       const attempt = async (work: () => Promise<void>) => { try { await work() } catch (error) { errors.push(error) } }
       await attempt(() => this.shared.release(sessionID))
       const isolated = registry.managers.get(this.profile(sessionID))
-      const attached = registry.managers.get(`${this.config.profileDirectory}:user`)
+      const attached = registry.managers.get(attachedManagerKey(this.config.profileDirectory))
       let isolatedStopped = !isolated
       if (attached) await attempt(() => attached.release(sessionID))
       if (isolated) {
@@ -225,10 +239,7 @@ export class BrowserRouter {
       })
       if (errors.length === 1) throw errors[0]
       if (errors.length) throw new AggregateError(errors, "Browser session cleanup was incomplete; retry deletion")
-      const transfer = registry.transfers.get(this.transferKey(sessionID))
-      transfer?.source.unpinTransfer(sessionID)
-      transfer?.destination.unpinTransfer(sessionID)
-      registry.transfers.delete(this.transferKey(sessionID))
+      this.completeTransfer(sessionID)
       await this.storage.remove(this.key(sessionID))
       await this.storage.remove(this.deletionKey(sessionID))
     })
