@@ -331,7 +331,9 @@ test("mode command requires confirmation, changes only the requested session, an
     f.confirm = async () => false
     await command.run("mode isolated")
     assert.deepEqual(f.modeCalls, [])
-    assert.match(f.confirmations[0].message, /closes all browser tabs owned by this session/)
+    assert.match(f.confirmations[0].message, /preserving page handles/)
+    assert.match(f.confirmations[0].message, /server-side effects/)
+    assert.match(f.confirmations[0].message, /cookies, and authentication remain separate/)
     assert.match(f.confirmations[0].message, /\n\nOther sessions/)
     assert.doesNotMatch(f.confirmations[0].message, /remote-debugging|In Attach mode/)
     f.confirm = async () => true
@@ -341,6 +343,7 @@ test("mode command requires confirmation, changes only the requested session, an
     await command.run("mode isolated")
     assert.deepEqual(f.modeCalls, ["isolated"])
     await command.run("mode attach")
+    assert.match(f.confirmations.at(-1)!.message, /closes all browser tabs owned by this session/)
     assert.match(f.confirmations.at(-1)!.message, /\n\nTo attach/)
     assert.match(f.confirmations.at(-1)!.message, /chrome:\/\/inspect\/#remote-debugging/)
     assert.doesNotMatch(f.confirmations.at(-1)!.message, /last tab/)

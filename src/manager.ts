@@ -14,6 +14,7 @@ interface Page extends PublicPage { sessionID: string; tabId: string; upstreamId
 interface Lease { touched: number }
 interface Login { sessionID: string; deadline: number }
 interface RawPage { id: number; url: string; title: string }
+export class TransferTabsMissing extends Error {}
 interface Dependencies {
   chrome: Pick<Chrome, "start" | "stop"> & { current?(browser: BrowserProcess): Promise<boolean> }
   connect: typeof connectMcp
@@ -25,6 +26,7 @@ export class BrowserManager {
   private pages = new Map<string, Page>()
   private pendingPages = new Map<string, string>()
   private leases = new Map<string, Lease>()
+  private transferPins = new Set<string>()
   private browser?: BrowserProcess
   private mcp?: Mcp
   private login?: Login
@@ -117,6 +119,7 @@ export class BrowserManager {
         const page = this.owned(input.pageId, caller.sessionID)
         await this.refresh()
         if (!this.pages.has(page.pageId)) throw new Error("This page has closed")
+        this.assertRestartAllowed()
         this.login = { sessionID: caller.sessionID, deadline: this.dependencies.now() + this.config.loginTimeoutMs }
         try {
           await this.transition(false)
@@ -194,7 +197,22 @@ export class BrowserManager {
   /** Passive UI inspection: never launch/restart Chrome, touch leases, or select a page. */
   async inspectPages(sessionID: string, signal?: AbortSignal): Promise<PagesSnapshot> {
     if (!sessionID) throw new Error("Browser inspection requires a session ID")
-    return this.serial.run(async () => {
+    return this.serial.run(() => this.inspectTransfer(sessionID), signal)
+  }
+
+  /** Only call these transfer primitives while holding this manager's queue. */
+  async withTransfer<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.serial.run(work, signal)
+  }
+
+  pinTransfer(sessionID: string) { this.transferPins.add(sessionID) }
+  unpinTransfer(sessionID: string) { this.transferPins.delete(sessionID) }
+
+  private assertRestartAllowed() {
+    if (this.transferPins.size) throw new Error("Browser restart blocked by an incomplete mode switch. Retry browser inspection or mode switching in the affected session to finish recovery.")
+  }
+
+  async inspectTransfer(sessionID: string): Promise<PagesSnapshot> {
       this.assertActive()
       await this.invalidateDeadBrowser()
       const state = { visibility: this.visibility, paused: !!this.login || !!this.restoration }
@@ -227,7 +245,6 @@ export class BrowserManager {
         pages.push({ pageId: page.pageId, title: target.title, url: target.url })
       }
       return { ...state, pages }
-    }, signal)
   }
 
   private status(sessionID: string) {
@@ -319,6 +336,7 @@ export class BrowserManager {
   }
 
   private async transition(headless: boolean) {
+    this.assertRestartAllowed()
     if (!this.restoration) {
       if (this.mcp && this.browser?.alive()) await this.refresh()
       this.restoration = [...this.pages.values()].map((page) => ({ ...page }))
@@ -343,7 +361,43 @@ export class BrowserManager {
 
   async release(sessionID: string) { return this.serial.run(() => this.releaseSession(sessionID)) }
 
-  private async releaseSession(sessionID: string) {
+  /** Prepare replacement tabs without disturbing the source manager. */
+  async prepareTransfer(sessionID: string, pages: PublicPage[], signal?: AbortSignal) {
+    return this.serial.run(() => this.prepareTransferLocked(sessionID, pages, signal), signal)
+  }
+
+  async prepareTransferLocked(sessionID: string, pages: PublicPage[], signal?: AbortSignal) {
+      this.assertActive()
+      if (this.login || this.restoration) throw new Error("Destination browser is paused for login or recovery")
+      if ([...this.pages.values()].some((page) => page.sessionID === sessionID) || [...this.pendingPages.values()].includes(sessionID)) {
+        throw new Error("Destination still owns tabs for this session; cleanup is required")
+      }
+      if (!pages.length) return
+      this.touch(sessionID)
+      await this.ensure()
+      for (const saved of pages) {
+        signal?.throwIfAborted()
+        const page = await this.createPage(sessionID, saved.pageId)
+        if (/^https?:\/\//i.test(saved.url)) data(await this.call("navigate_page", { pageId: page.upstreamId, url: saved.url }, signal))
+      }
+      signal?.throwIfAborted()
+      await this.refresh()
+      if (pages.some((page) => this.pages.get(page.pageId)?.sessionID !== sessionID)) {
+        throw new Error("A replacement tab closed during the browser mode switch")
+      }
+  }
+
+  async validateTransfer(sessionID: string, pages: PublicPage[]) {
+    const state = await this.inspectTransfer(sessionID)
+    if (state.paused) {
+      throw new Error("Transfer tabs cannot be verified while the browser is paused; retry browser mode recovery")
+    }
+    if (pages.some((page) => !state.pages.some((owned) => owned.pageId === page.pageId))) {
+      throw new TransferTabsMissing("Transfer tabs cannot be verified; browser mode switch requires recovery and remaining tabs are retained")
+    }
+  }
+
+  async releaseSession(sessionID: string) {
     await this.invalidateDeadBrowser()
     await this.cleanupPending(sessionID)
     if (this.login?.sessionID === sessionID) {
@@ -382,19 +436,19 @@ export class BrowserManager {
       }
       const unloaded = this.unreferencedAt !== undefined && now - this.unreferencedAt >= this.config.unloadGraceMs
       for (const [sessionID, lease] of this.leases) {
-        if (unloaded || now - lease.touched >= this.config.leaseTimeoutMs) await this.releaseSession(sessionID)
+        if (!this.transferPins.has(sessionID) && (unloaded || now - lease.touched >= this.config.leaseTimeoutMs)) await this.releaseSession(sessionID)
       }
       // A failed launch can leave recovery state even though no browser exists.
-      if (!this.leases.size && (this.browser || this.restoration)) {
+      if (!this.transferPins.size && !this.leases.size && (this.browser || this.restoration)) {
         this.idleAt ??= now
         if (now - this.idleAt >= this.config.idleTimeoutMs) await this.stop()
       }
-      if (unloaded && !this.browser && !this.mcp && !this.leases.size && !this.login && !this.restoration) {
+      if (unloaded && !this.transferPins.size && !this.browser && !this.mcp && !this.leases.size && !this.login && !this.restoration) {
         this.retire()
       }
       // Preserve a headed selection made before launch; evicting that manager
       // would silently recreate it with the default headless visibility.
-      if (this.evictWhenIdle && this.visibility === "headless" && this.serial.queued === 1 && !this.browser && !this.mcp && !this.leases.size && !this.login && !this.restoration && !this.pendingPages.size) this.retire(true)
+      if (this.evictWhenIdle && !this.transferPins.size && this.visibility === "headless" && this.serial.queued === 1 && !this.browser && !this.mcp && !this.leases.size && !this.login && !this.restoration && !this.pendingPages.size) this.retire(true)
       this.maintenanceError = undefined
     })
   }
@@ -447,6 +501,7 @@ export class BrowserManager {
     // Migrate live managers from the old field without changing browser visibility.
     const legacy = manager as BrowserManager & { mode?: BrowserVisibility }
     manager.pendingPages ??= new Map()
+    manager.transferPins ??= new Set()
     manager.retiredListeners ??= new Set()
     manager.visibility ??= legacy.mode ?? (manager.login ? "headed" : "headless")
     delete legacy.mode

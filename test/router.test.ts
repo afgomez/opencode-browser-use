@@ -53,7 +53,7 @@ test("mode switches close only the switching session and wait for its operations
   const gate = new Promise<void>((resolve) => { unblock = resolve })
   const order: string[] = []
   t.mock.method(f.router.shared, "execute", async () => { order.push("start"); await gate; order.push("end"); return { content: "ok" } })
-  t.mock.method(f.router.shared, "release", async (id: string) => { order.push(`release:${id}`) })
+  t.mock.method(f.router.shared, "releaseSession", async (id: string) => { order.push(`release:${id}`) })
   try {
     const action = f.router.execute("list_pages", {}, { sessionID: "a", directory: f.root })
     const change = f.router.setMode("a", "isolated")
@@ -64,6 +64,194 @@ test("mode switches close only the switching session and wait for its operations
     assert.deepEqual(order, ["start", "end", "release:a"])
     assert.equal((await f.router.inspectPages("b")).mode, "shared")
   } finally { f.router.detach(); await f.router.shared.dispose(); await rm(f.root, { recursive: true, force: true }) }
+})
+
+test("switch recovery retains source on preparation failure and resolves uncertain persistence without replay", async (t) => {
+  const f = fixture()
+  const registry = (globalThis as any)[Symbol.for("opencode.browser-use.router.v1")]
+  const profile = join(`${f.config.profileDirectory}-isolated`, createHash("sha256").update("a").digest("hex"))
+  try {
+    // Construct the destination lazily without launching Chrome.
+    await f.router.setMode("a", "isolated")
+    await f.router.setMode("a", "shared")
+    const destination = registry.managers.get(profile)
+    const pages = [{ pageId: "stable", url: "https://example.test/", title: "" }]
+    t.mock.method(f.router.shared, "inspectTransfer", async () => ({ visibility: "headless" as const, paused: false, pages }))
+    let prepares = 0, sourceReleases = 0, destinationReleases = 0, failPrepare = true
+    t.mock.method(destination, "prepareTransferLocked", async (_id: string, input: typeof pages) => {
+      prepares++
+      assert.deepEqual(input, pages)
+      if (failPrepare) throw new Error("prepare failed")
+    })
+    t.mock.method(destination, "validateTransfer", async () => {})
+    t.mock.method(destination, "releaseSession", async () => { destinationReleases++ })
+    t.mock.method(f.router.shared, "releaseSession", async () => { sourceReleases++ })
+    await assert.rejects(f.router.setMode("a", "isolated"), /prepare failed/)
+    assert.equal(sourceReleases, 0)
+    assert.equal(destinationReleases, 1)
+    failPrepare = false
+    const set = f.store.set.bind(f.store)
+    t.mock.method(f.store, "set", async (key: string, value: string) => { await set(key, value); throw new Error("write response lost") })
+    await assert.rejects(f.router.setMode("a", "isolated"), /write response lost/)
+    assert.equal(sourceReleases, 1)
+    assert.equal(prepares, 2)
+    assert.equal((await f.router.inspectPages("a")).mode, "isolated")
+    assert.equal(prepares, 2, "uncertain writes must not replay navigation")
+  } finally { t.mock.restoreAll(); f.router.detach(); await f.router.shared.dispose(); const dest = registry.managers.get(profile); await dest?.dispose(); await rm(f.root, { recursive: true, force: true }) }
+})
+
+test("partial source cleanup blocks operations until retried, without repeating preparation", async (t) => {
+  const f = fixture()
+  const registry = (globalThis as any)[Symbol.for("opencode.browser-use.router.v1")]
+  const profile = join(`${f.config.profileDirectory}-isolated`, createHash("sha256").update("a").digest("hex"))
+  try {
+    await f.router.setMode("a", "isolated")
+    await f.router.setMode("a", "shared")
+    const dest = registry.managers.get(profile)
+    let attempts = 0, prepares = 0, fail = true
+    t.mock.method(dest, "prepareTransferLocked", async () => { prepares++ })
+    t.mock.method(f.router.shared, "releaseSession", async () => { attempts++; if (fail) throw new Error("source cleanup failed") })
+    await assert.rejects(f.router.setMode("a", "isolated"), /switch incomplete/)
+    assert.equal(attempts, 2)
+    await assert.rejects(f.router.inspectPages("a"), /source cleanup failed/)
+    assert.equal(prepares, 1)
+    fail = false
+    assert.equal((await f.router.inspectPages("a")).mode, "isolated")
+    assert.equal(prepares, 1)
+    assert.equal(registry.transfers.has(`${f.config.profileDirectory}:a`), false)
+  } finally { t.mock.restoreAll(); f.router.detach(); await f.router.shared.dispose(); await registry.managers.get(profile)?.dispose(); await rm(f.root, { recursive: true, force: true }) }
+})
+
+test("cancelled preparation cleans destination and leaves source mode intact", async (t) => {
+  const f = fixture()
+  const registry = (globalThis as any)[Symbol.for("opencode.browser-use.router.v1")]
+  const profile = join(`${f.config.profileDirectory}-isolated`, createHash("sha256").update("a").digest("hex"))
+  try {
+    await f.router.setMode("a", "isolated")
+    await f.router.setMode("a", "shared")
+    const dest = registry.managers.get(profile)
+    const controller = new AbortController()
+    let cleaned = 0
+    t.mock.method(dest, "prepareTransferLocked", async () => { controller.abort() })
+    t.mock.method(dest, "releaseSession", async () => { cleaned++ })
+    await assert.rejects(f.router.setMode("a", "isolated", controller.signal))
+    assert.equal(cleaned, 1)
+    assert.equal((await f.router.inspectPages("a")).mode, "shared")
+  } finally { t.mock.restoreAll(); f.router.detach(); await f.router.shared.dispose(); await registry.managers.get(profile)?.dispose(); await rm(f.root, { recursive: true, force: true }) }
+})
+
+test("destination loss rolls back to intact source without replay, retrying uncertain writes and cleanup", async (t) => {
+  const f = fixture()
+  const registry = (globalThis as any)[Symbol.for("opencode.browser-use.router.v1")]
+  const profile = join(`${f.config.profileDirectory}-isolated`, createHash("sha256").update("a").digest("hex"))
+  try {
+    await f.router.setMode("a", "isolated")
+    await f.router.setMode("a", "shared")
+    const dest = registry.managers.get(profile)
+    const pages = [{ pageId: "stable", url: "https://example.test/", title: "" }]
+    t.mock.method(f.router.shared, "inspectTransfer", async () => ({ visibility: "headless" as const, paused: false, pages }))
+    let prepares = 0, releases = 0, cleanups = 0, writeFails = true, cleanupFails = true
+    t.mock.method(dest, "prepareTransferLocked", async () => { prepares++ })
+    t.mock.method(f.router.shared, "releaseSession", async () => { releases++ })
+    t.mock.method(dest, "releaseSession", async () => { cleanups++; if (cleanupFails) throw new Error("cleanup failed") })
+    const set = f.store.set.bind(f.store)
+    t.mock.method(f.store, "set", async (key: string, value: string) => {
+      if (value === "shared" && writeFails) throw new Error("rollback write failed")
+      await set(key, value)
+      if (value === "shared") throw new Error("rollback response lost")
+    })
+    // The destination has no surviving tabs when persistence finishes.
+    await assert.rejects(f.router.setMode("a", "isolated"), /switch incomplete/)
+    await assert.rejects(f.router.inspectPages("a"), /Could not confirm restored source mode/)
+    ;(f.router.shared as any).leases.set("a", { touched: 0 })
+    await f.router.shared.sweep()
+    assert.equal(releases, 0)
+    assert.equal(prepares, 1)
+    assert.equal(registry.transfers.has(`${f.config.profileDirectory}:a`), true)
+    writeFails = false
+    await assert.rejects(f.router.inspectPages("a"), /cleanup failed/)
+    assert.equal(f.values.get(`browser-mode.${createHash("sha256").update("a").digest("hex")}`), "shared")
+    cleanupFails = false
+    assert.equal((await f.router.inspectPages("a")).mode, "shared")
+    assert.equal(cleanups, 2)
+    assert.equal(releases, 0)
+    assert.equal(prepares, 1)
+    assert.equal(registry.transfers.has(`${f.config.profileDirectory}:a`), false)
+  } finally { t.mock.restoreAll(); f.router.detach(); await f.router.shared.dispose(); await registry.managers.get(profile)?.dispose(); registry.transfers.delete(`${f.config.profileDirectory}:a`); await rm(f.root, { recursive: true, force: true }) }
+})
+
+test("unverifiable destination or partially lost source never causes destructive rollback", async (t) => {
+  const f = fixture()
+  const registry = (globalThis as any)[Symbol.for("opencode.browser-use.router.v1")]
+  const profile = join(`${f.config.profileDirectory}-isolated`, createHash("sha256").update("a").digest("hex"))
+  try {
+    await f.router.setMode("a", "isolated")
+    await f.router.setMode("a", "shared")
+    const dest = registry.managers.get(profile)
+    const pages = [{ pageId: "stable", url: "https://example.test/", title: "" }]
+    let intact = true, transient = true, cleanups = 0
+    t.mock.method(f.router.shared, "inspectTransfer", async () => ({ visibility: "headless" as const, paused: false, pages: intact ? pages : [] }))
+    t.mock.method(dest, "prepareTransferLocked", async () => {})
+    t.mock.method(dest, "inspectTransfer", async () => {
+      if (transient) throw new Error("metadata unavailable")
+      return { visibility: "headless" as const, paused: false, pages: [] }
+    })
+    t.mock.method(dest, "releaseSession", async () => { cleanups++ })
+    await assert.rejects(f.router.setMode("a", "isolated"), /switch incomplete/)
+    await assert.rejects(f.router.inspectPages("a"), /metadata unavailable/)
+    transient = false
+    intact = false
+    await assert.rejects(f.router.inspectPages("a"), /cannot be verified/)
+    assert.equal(f.values.get(`browser-mode.${createHash("sha256").update("a").digest("hex")}`), "isolated")
+    assert.equal(cleanups, 0)
+    intact = true
+    assert.equal((await f.router.inspectPages("a")).mode, "shared")
+    assert.equal(cleanups, 1)
+  } finally { t.mock.restoreAll(); f.router.detach(); await f.router.shared.dispose(); await registry.managers.get(profile)?.dispose(); registry.transfers.delete(`${f.config.profileDirectory}:a`); await rm(f.root, { recursive: true, force: true }) }
+})
+
+test("both lifecycle queues remain locked across persistence in either transfer direction", async (t) => {
+  const f = fixture()
+  const registry = (globalThis as any)[Symbol.for("opencode.browser-use.router.v1")]
+  const profile = join(`${f.config.profileDirectory}-isolated`, createHash("sha256").update("a").digest("hex"))
+  try {
+    await f.router.setMode("a", "isolated")
+    const dest = registry.managers.get(profile)
+    dest.evictWhenIdle = false
+    for (const mode of ["shared", "isolated"] as const) {
+      let entered!: () => void, unblock!: () => void
+      const ready = new Promise<void>((resolve) => { entered = resolve })
+      const gate = new Promise<void>((resolve) => { unblock = resolve })
+      const set = f.store.set.bind(f.store)
+      const mock = t.mock.method(f.store, "set", async (key: string, value: string) => { entered(); await gate; await set(key, value) })
+      const change = f.router.setMode("a", mode)
+      await ready
+      let sharedDone = false, isolatedDone = false
+      const shared = f.router.shared.execute("set_visibility", { visibility: "headed" }, { sessionID: "b", directory: f.root }).then(() => { sharedDone = true })
+      const isolated = dest.sweep().then(() => { isolatedDone = true })
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(sharedDone, false)
+      assert.equal(isolatedDone, false)
+      unblock()
+      await Promise.all([change, shared, isolated])
+      mock.mock.restore()
+    }
+  } finally { t.mock.restoreAll(); f.router.detach(); await f.router.shared.dispose(); await registry.managers.get(profile)?.dispose(); await rm(f.root, { recursive: true, force: true }) }
+})
+
+test("empty transfer cannot enter a shared browser paused for login or recovery", async () => {
+  const f = fixture()
+  const registry = (globalThis as any)[Symbol.for("opencode.browser-use.router.v1")]
+  const profile = join(`${f.config.profileDirectory}-isolated`, createHash("sha256").update("a").digest("hex"))
+  try {
+    await f.router.setMode("a", "isolated")
+    for (const state of ["login", "restoration"] as const) {
+      ;(f.router.shared as any)[state] = state === "login" ? { sessionID: "b", deadline: Infinity } : []
+      await assert.rejects(f.router.setMode("a", "shared"), /Destination browser is paused/)
+      ;(f.router.shared as any)[state] = undefined
+      assert.equal((await f.router.inspectPages("a")).mode, "isolated")
+    }
+  } finally { (f.router.shared as any).login = undefined; (f.router.shared as any).restoration = undefined; f.router.detach(); await f.router.shared.dispose(); await registry.managers.get(profile)?.dispose(); await rm(f.root, { recursive: true, force: true }) }
 })
 
 test("user login never launches or restarts Chrome and visibility is unavailable", async () => {

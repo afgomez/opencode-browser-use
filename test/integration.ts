@@ -157,24 +157,33 @@ test("isolated sessions have independent cookies retained after switching away",
   const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`
   const a = { sessionID: "isolated-a", directory }
   const b = { sessionID: "isolated-b", directory }
+  const c = { sessionID: "shared-c", directory }
   const parse = (result: any) => JSON.parse(typeof result.content === "string" ? result.content : result.content[0].text)
   try {
     await router.setMode(a.sessionID, "isolated")
     await router.setMode(b.sessionID, "isolated")
     const pageA = parse(await router.execute("new_page", { url: `${origin}/set` }, a)).pages[0].pageId
     const pageB = parse(await router.execute("new_page", { url: origin }, b)).pages[0].pageId
+    const pageC = parse(await router.execute("new_page", { url: origin }, c)).pages[0].pageId
+    const unsafe = parse(await router.execute("new_page", { url: "data:text/html,unsafe" }, a)).pages.find((page: any) => page.pageId !== pageA).pageId
     assert.doesNotMatch(JSON.stringify(await router.execute("evaluate_script", { pageId: pageB, function: "() => document.cookie" }, b)), /private_cookie/)
+    await router.execute("navigate_page", { pageId: pageA, url: origin }, a)
     await router.setMode(a.sessionID, "shared")
     assert.equal((await router.inspectPages(b.sessionID)).pages[0].pageId, pageB)
-    await assert.rejects(router.execute("take_snapshot", { pageId: pageA }, a), /foreign page handle/)
-    const shared = parse(await router.execute("new_page", { url: origin }, a)).pages[0].pageId
-    assert.doesNotMatch(JSON.stringify(await router.execute("evaluate_script", { pageId: shared, function: "() => document.cookie" }, a)), /private_cookie/)
+    const transferred = (await router.inspectPages(a.sessionID)).pages
+    assert.equal(transferred[0].pageId, pageA)
+    assert.equal(transferred[1].pageId, unsafe)
+    assert.match(transferred[1].url, /^about:blank/)
+    assert.equal((await router.inspectPages(c.sessionID)).pages[0].pageId, pageC)
+    assert.doesNotMatch(JSON.stringify(await router.execute("evaluate_script", { pageId: pageA, function: "() => document.cookie" }, a)), /private_cookie/)
     await router.setMode(a.sessionID, "isolated")
-    const restored = parse(await router.execute("new_page", { url: origin }, a)).pages[0].pageId
-    assert.match(JSON.stringify(await router.execute("evaluate_script", { pageId: restored, function: "() => document.cookie" }, a)), /private_cookie=secret/)
+    assert.equal((await router.inspectPages(a.sessionID)).pages[0].pageId, pageA)
+    assert.equal((await router.inspectPages(c.sessionID)).pages[0].pageId, pageC)
+    assert.match(JSON.stringify(await router.execute("evaluate_script", { pageId: pageA, function: "() => document.cookie" }, a)), /private_cookie=secret/)
   } finally {
     await router.delete(a.sessionID)
     await router.delete(b.sessionID)
+    await router.delete(c.sessionID)
     router.detach()
     await router.shared.dispose()
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))

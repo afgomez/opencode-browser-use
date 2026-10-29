@@ -112,6 +112,71 @@ function fixture() {
   }
 }
 
+test("transfer prepares only HTTP(S) URLs with preserved handles and leaves other owners alone", async () => {
+  const f = fixture()
+  try {
+    const other = await f.open("b")
+    await f.manager.prepareTransfer("a", [
+      { pageId: "http-handle", url: "https://example.test/path", title: "old" },
+      { pageId: "unsafe-handle", url: "file:///secret", title: "old" },
+    ])
+    const pages = (await f.manager.inspectPages("a")).pages
+    assert.deepEqual(pages.map((page) => page.pageId), ["http-handle", "unsafe-handle"])
+    assert.equal(pages[0].url, "https://example.test/path")
+    assert.match(pages[1].url, /^about:blank/)
+    assert.equal((await f.manager.inspectPages("b")).pages[0].pageId, other)
+    assert.equal(f.calls.filter((call) => call.name === "navigate_page" && call.args.url === "file:///secret").length, 0)
+    await f.manager.release("a")
+    assert.equal((await f.manager.inspectPages("b")).pages[0].pageId, other)
+  } finally { await f.manager.dispose() }
+})
+
+test("transfer verification detects browser crash and closed replacement tabs", async () => {
+  for (const failure of ["crash", "closed"] as const) {
+    const f = fixture()
+    const pages = [{ pageId: "stable", url: "https://example.test/", title: "" }]
+    try {
+      await f.manager.prepareTransfer("a", pages)
+      await f.manager.withTransfer(() => f.manager.validateTransfer("a", pages))
+      if (failure === "crash") f.crash()
+      else for (const [id, tab] of f.tabs) if (tab.url === pages[0].url) f.tabs.delete(id)
+      await assert.rejects(f.manager.withTransfer(() => f.manager.validateTransfer("a", pages)), /cannot be verified/)
+      assert.equal(f.calls.filter((call) => call.name === "navigate_page").length, 1)
+    } finally { await f.manager.dispose() }
+  }
+})
+
+test("transfer pins prevent other sessions from restarting shared Chrome but allow cleanup", async () => {
+  const f = fixture()
+  try {
+    const retained = await f.open("a")
+    const other = await f.open("b")
+    f.manager.pinTransfer("a")
+    const navigations = f.calls.filter((call) => call.name === "navigate_page").length
+    await assert.rejects(f.manager.execute("login_start", { pageId: other }, caller("b")), /restart blocked.*incomplete mode switch/i)
+    await assert.rejects(f.manager.execute("set_visibility", { visibility: "headed" }, caller("b")), /restart blocked.*incomplete mode switch/i)
+    assert.equal(parse(await f.manager.execute("status", {}, caller("b"))).paused, false)
+    await f.manager.release("b")
+    assert.equal((await f.manager.inspectPages("a")).pages[0].pageId, retained)
+    assert.equal(f.headlessLaunches.length, 1)
+    assert.equal(f.calls.filter((call) => call.name === "navigate_page").length, navigations)
+    f.manager.unpinTransfer("a")
+    await f.manager.execute("set_visibility", { visibility: "headed" }, caller("a"))
+    assert.equal(f.headlessLaunches.length, 2)
+  } finally { await f.manager.dispose() }
+})
+
+test("failed transfer preparation retains tracked tabs for cleanup without replay", async () => {
+  const f = fixture()
+  try {
+    f.failNavigation("https://bad.test/")
+    await assert.rejects(f.manager.prepareTransfer("a", [{ pageId: "id", url: "https://bad.test/", title: "" }]), /restoration navigation failed/)
+    assert.equal(f.calls.filter((call) => call.name === "navigate_page").length, 1)
+    await f.manager.release("a")
+    assert.deepEqual((await f.manager.inspectPages("a")).pages, [])
+  } finally { await f.manager.dispose() }
+})
+
 test("pending markers are discarded after a confirmed browser crash", async () => {
   const f = fixture()
   try {

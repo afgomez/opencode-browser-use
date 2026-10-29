@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto"
 import { join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
-import { BrowserManager, sharedManager, type Caller } from "./manager"
+import { BrowserManager, sharedManager, TransferTabsMissing, type Caller } from "./manager"
 import type { Options } from "./options"
 import { Serial } from "./serial"
 import { AttachChrome } from "./attach-chrome"
 import { Chrome } from "./chrome"
 import { connectMcp } from "./mcp"
+import type { PublicPage } from "./policy"
 
 export type BrowserMode = "shared" | "isolated" | "attach"
 export function browserMode(value: unknown): BrowserMode {
@@ -14,10 +15,12 @@ export function browserMode(value: unknown): BrowserMode {
   throw new Error("Browser mode must be shared, isolated, or attach")
 }
 type Storage = { get(key: string): Promise<unknown>; set(key: string, value: string): Promise<void>; remove(key: string): Promise<void>; scan?(options: { prefix: string; after?: string; limit?: number }): Promise<{ entries: readonly { key: string; value: unknown }[]; next?: string }> }
-type Registry = { queues: Map<string, Serial>; managers: Map<string, BrowserManager> }
+type Transfer = { source: BrowserManager; destination: BrowserManager; old: BrowserMode; mode: BrowserMode; phase: "preparing" | "persisting" | "rollingBack"; pages?: PublicPage[] }
+type Registry = { queues: Map<string, Serial>; managers: Map<string, BrowserManager>; transfers: Map<string, Transfer> }
 const symbol = Symbol.for("opencode.browser-use.router.v1")
 const root = globalThis as typeof globalThis & { [symbol]?: Registry }
-const registry = root[symbol] ??= { queues: new Map(), managers: new Map() }
+const registry = root[symbol] ??= { queues: new Map(), managers: new Map(), transfers: new Map() }
+registry.transfers ??= new Map()
 const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 
 /** Routes by persisted session choice. The per-session queue serializes switches with tools. */
@@ -39,6 +42,50 @@ export class BrowserRouter {
   }
   private key(sessionID: string) { return `browser-mode.${hash(sessionID)}` }
   private deletionKey(sessionID: string) { return `browser-deletion.${hash(sessionID)}` }
+  private transferKey(sessionID: string) { return `${this.config.profileDirectory}:${sessionID}` }
+  private async recoverTransfer(sessionID: string) {
+    const key = this.transferKey(sessionID)
+    const transfer = registry.transfers.get(key)
+    if (!transfer) return
+    await this.lockTransfer(transfer, () => this.recoverTransferLocked(sessionID, transfer))
+  }
+  private lockTransfer<T>(transfer: Transfer, work: () => Promise<T>, signal?: AbortSignal) {
+    // Every managed transfer includes shared. Always acquire it first, even
+    // when it is the destination, to avoid cycles between concurrent switches.
+    const other = transfer.source === this.shared ? transfer.destination : transfer.source
+    return this.shared.withTransfer(() => other.withTransfer(work, signal), signal)
+  }
+  private async recoverTransferLocked(sessionID: string, transfer: Transfer) {
+    // A failed storage write can have committed despite throwing. Never replay
+    // navigation: determine which copy to keep from the persisted choice.
+    let mode = transfer.phase === "preparing" ? transfer.old : await this.mode(sessionID)
+    if (mode !== transfer.old && mode !== transfer.mode) throw new Error("Cannot resolve incomplete browser mode switch")
+    if (mode === transfer.mode && transfer.phase !== "rollingBack") {
+      if (!transfer.pages) throw new Error("Cannot verify destination tabs; source tabs are retained for recovery")
+      try { await transfer.destination.validateTransfer(sessionID, transfer.pages) } catch (error) {
+        if (!(error instanceof TransferTabsMissing)) throw error
+        transfer.phase = "rollingBack"
+      }
+    }
+    if (transfer.phase === "rollingBack") {
+      if (!transfer.pages) throw new Error("Cannot verify source tabs; both copies are retained for recovery")
+      // A previous source cleanup may have partially succeeded. Never select a
+      // source that has lost handles, and never recreate tabs by navigation.
+      await transfer.source.validateTransfer(sessionID, transfer.pages)
+      if (mode !== transfer.old) {
+        let writeError: unknown
+        try { await this.storage.set(this.key(sessionID), transfer.old) } catch (error) { writeError = error }
+        // Even a failed write may have committed; cleanup only after a read
+        // confirms the source choice. Retain the rollback intent on failure.
+        mode = await this.mode(sessionID)
+        if (mode !== transfer.old) throw new Error("Could not confirm restored source mode; both tab copies are retained. Retry recovery.", { cause: writeError })
+      }
+    }
+    await (mode === transfer.old ? transfer.destination : transfer.source).releaseSession(sessionID)
+    registry.transfers.delete(this.transferKey(sessionID))
+    transfer.source.unpinTransfer(sessionID)
+    transfer.destination.unpinTransfer(sessionID)
+  }
   private profile(sessionID: string) { return join(`${this.config.profileDirectory}-isolated`, hash(sessionID)) }
   private queue(sessionID: string) {
     const key = `${this.config.profileDirectory}:${sessionID}`
@@ -70,6 +117,7 @@ export class BrowserRouter {
   }
   async execute(name: string, input: Record<string, unknown>, caller: Caller) {
     return this.queue(caller.sessionID).run(async () => {
+      await this.recoverTransfer(caller.sessionID)
       const mode = await this.mode(caller.sessionID)
       if (mode === "attach" && (name === "login_start" || name === "login_finish")) {
         return { content: "User Chrome is not restarted or paused. Ask the user to log in manually in their Chrome, then continue after they confirm." }
@@ -91,6 +139,7 @@ export class BrowserRouter {
   }
   async inspectPages(sessionID: string, signal?: AbortSignal) {
     return this.queue(sessionID).run(async () => {
+      await this.recoverTransfer(sessionID)
       const mode = await this.mode(sessionID)
       const snapshot = await this.manager(mode, sessionID).inspectPages(sessionID, signal)
       return { ...snapshot, mode, visibility: mode === "attach" ? null : snapshot.visibility }
@@ -98,14 +147,45 @@ export class BrowserRouter {
   }
   async setMode(sessionID: string, value: unknown, signal?: AbortSignal) {
     return this.queue(sessionID).run(async () => {
+      await this.recoverTransfer(sessionID)
       const mode = browserMode(value)
       const old = await this.mode(sessionID)
       if (mode === old) return
       const manager = this.manager(old, sessionID)
-      const state = await manager.inspectPages(sessionID, signal)
-      if (state.paused) throw new Error("Finish the browser login or recovery before switching mode")
-      await manager.release(sessionID)
-      await this.storage.set(this.key(sessionID), mode)
+      if (old === "attach" || mode === "attach") {
+        const state = await manager.inspectPages(sessionID, signal)
+        if (state.paused) throw new Error("Finish the browser login or recovery before switching mode")
+        await manager.release(sessionID)
+        await this.storage.set(this.key(sessionID), mode)
+        return
+      }
+      const destination = this.manager(mode, sessionID)
+      const key = this.transferKey(sessionID)
+      const transfer: Transfer = { source: manager, destination, old, mode, phase: "preparing" }
+      await this.lockTransfer(transfer, async () => {
+        const state = await manager.inspectTransfer(sessionID)
+        if (state.paused) throw new Error("Finish the browser login or recovery before switching mode")
+        transfer.pages = state.pages
+        manager.pinTransfer(sessionID)
+        destination.pinTransfer(sessionID)
+        registry.transfers.set(key, transfer)
+        try {
+          await destination.prepareTransferLocked(sessionID, state.pages, signal)
+          signal?.throwIfAborted()
+          transfer.phase = "persisting"
+          await this.storage.set(this.key(sessionID), mode)
+          await destination.validateTransfer(sessionID, state.pages)
+          await manager.releaseSession(sessionID)
+          registry.transfers.delete(key)
+          manager.unpinTransfer(sessionID)
+          destination.unpinTransfer(sessionID)
+        } catch (error) {
+          try { await this.recoverTransferLocked(sessionID, transfer) } catch (cleanup) {
+            throw new AggregateError([error, cleanup], "Browser mode switch incomplete; owned tabs are retained and cleanup will be retried")
+          }
+          throw error
+        }
+      }, signal)
     }, signal)
   }
   async delete(sessionID: string) {
@@ -145,6 +225,10 @@ export class BrowserRouter {
       })
       if (errors.length === 1) throw errors[0]
       if (errors.length) throw new AggregateError(errors, "Browser session cleanup was incomplete; retry deletion")
+      const transfer = registry.transfers.get(this.transferKey(sessionID))
+      transfer?.source.unpinTransfer(sessionID)
+      transfer?.destination.unpinTransfer(sessionID)
+      registry.transfers.delete(this.transferKey(sessionID))
       await this.storage.remove(this.key(sessionID))
       await this.storage.remove(this.deletionKey(sessionID))
     })

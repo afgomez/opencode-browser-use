@@ -46,9 +46,23 @@ model tools. Switch with the sidebar settings dialog or:
 
 `/browser-use` without arguments opens the same settings dialog as the sidebar.
 
-Every actual change requires confirmation and closes the switching session's
-owned tabs. Their handles and unsaved state are not restored. Other sessions'
-tabs are unaffected. Switching during login or recovery is blocked.
+Every actual change requires confirmation. Between Shared and Isolated, live
+owned tabs are reopened in the destination before the originals are closed;
+page handles stay the same, but snapshots and unsaved page state are lost. Only
+HTTP(S) URLs are reopened; other schemes become blank tabs. Reopening URLs can
+have server-side effects. Profiles, cookies, and authentication are not copied.
+Switches to or from Attach close owned tabs without restoring them or their
+handles. Other sessions' tabs are unaffected. Switching during login or recovery
+is blocked. If a switch fails, cleanup is retried before later session operations;
+an error can occur after the new mode was saved, so check the current mode.
+If destination tabs are confirmed lost and the source tabs are intact, recovery
+restores the source mode without reopening URLs. Uncertain storage or cleanup
+failures retain both copies and require a retry. While recovery is incomplete,
+login and visibility restarts of either affected browser are blocked, including
+for other Shared sessions. Retry inspection or mode switching in the affected
+session. Transfer recovery and page handles are in-memory only and do not survive
+a service restart; profiles and the saved mode persist, but tabs cannot be
+recovered through their old handles after restart.
 
 - **Shared** uses the existing plugin-owned Chrome and persistent profile.
   Sessions share cookies and storage; tab ownership remains per session.
@@ -114,8 +128,8 @@ not the entire browser or its parent/subagent sessions.
 The title-row **Settings** button opens a custom dialog showing mode and visibility
 choices together. Use the mouse or arrow keys/Tab and Enter to choose. The
 current mode and visibility appear beneath the title (for example, **Shared / Headless**); visibility
-is hidden in Attach mode. Mode changes require confirmation and close this
-session's owned tabs. Visibility changes require confirmation and reload the
+is hidden in Attach mode. Mode changes require confirmation and transfer or close
+this session's owned tabs as described above. Visibility changes require confirmation and reload the
 affected browser's owned tabs: all Shared sessions, or only the Isolated
 session. Unsaved page state and snapshots are lost. Controls show a spinner
 while applying a confirmed change and are disabled during login/recovery or

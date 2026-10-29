@@ -56,7 +56,9 @@ export function createVisibility(context: Context) {
         if (!mode || view.signal.aborted) return
         if (mode === (snapshot.mode ?? "shared")) return snapshot
         const message = [
-          "This closes all browser tabs owned by this session. Their contents and handles will not be restored.",
+          ...(mode === "attach" || snapshot.mode === "attach"
+            ? ["This closes all browser tabs owned by this session. Their contents and handles will not be restored."]
+            : ["This reopens this session's HTTP(S) tabs in the other profile, preserving page handles. Reopening URLs can cause server-side effects. Other URLs become blank tabs. Unsaved state and snapshots are lost; take fresh snapshots.", "Profiles, cookies, and authentication remain separate."]),
           "Other sessions are unaffected.",
           ...(mode === "attach" ? ["To attach, enable chrome://inspect/#remote-debugging and approve Chrome's connection requests."] : []),
         ].join("\n\n")
