@@ -61,7 +61,9 @@ export default Plugin.define({
       void (async () => {
         try {
           for await (const event of ctx.event.subscribe({ types: ["session.deleted"], signal: events.signal })) {
-            await manager.release(event.data.sessionID)
+            try { await manager.release(event.data.sessionID) } catch (error) {
+              if (!events.signal.aborted) console.error("[browser-use] Session cleanup failed", error)
+            }
           }
         } catch (error) {
           if (!events.signal.aborted) console.error("[browser-use] Session cleanup event stream failed", error)
