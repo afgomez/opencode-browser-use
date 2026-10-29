@@ -14,14 +14,9 @@ export function BrowserSidebar(props: { sessionID: string; visibility?: Visibili
   const switching = () => visibility.switching(props.sessionID)
   const [unavailable, setUnavailable] = createSignal(false)
   const [visibilityHovered, setVisibilityHovered] = createSignal(false)
-  // The filled control style is "focused"; base/selected may be transparent.
-  // This is visual styling only and does not steal keyboard focus.
-  const visibilityButtonState = () => ({ disabled: unavailable() || busy() || snapshot().paused, focused: true })
-  const visibilityButtonBackground = () => {
-    const state = visibilityButtonState()
-    const color = context.theme.background.action.primary.state(state)
-    return visibilityHovered() && !state.disabled ? context.theme.increase(color) : color
-  }
+  const visibilityButtonState = () => ({ disabled: unavailable() || busy() || snapshot().paused, hovered: visibilityHovered() })
+  const visibilityButtonBackground = () => context.theme.background.action.secondary.state(visibilityButtonState())
+  const visibilityButtonText = () => context.theme.text.action.secondary.state(visibilityButtonState())
   let view: VisibilityView | undefined
   createEffect(() => {
     const sessionID = props.sessionID
@@ -62,7 +57,7 @@ export function BrowserSidebar(props: { sessionID: string; visibility?: Visibili
                 // Open after release, so the opening click cannot dismiss the dialog.
                 onMouseUp={(event) => { if (event.button === 0) { event.stopPropagation(); void chooseVisibility() } }}
               >
-                <text fg={context.theme.text.action.primary.state(visibilityButtonState())}>
+                <text fg={visibilityButtonText()}>
                   <strong>Settings</strong>
                 </text>
               </box>

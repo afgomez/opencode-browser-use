@@ -20,8 +20,8 @@ const actionColor = (base: string, hovered: string, disabled: string, focused = 
   state: (states: { disabled?: boolean; hovered?: boolean; focused?: boolean }) => states.disabled ? disabled : states.focused ? focused : states.hovered ? hovered : base,
 })
 const theme = {
-  text: { base: "#ffffff", muted: "#888888", action: { primary: actionColor("#111111", "#222222", "#999999") } },
-  background: { action: { primary: actionColor("#00000000", "#333333", "#333333", "#88aaff") } },
+  text: { base: "#ffffff", muted: "#888888", action: { primary: actionColor("#111111", "#222222", "#999999"), secondary: actionColor("#aaaaaa", "#ffffff", "#888888") } },
+  background: { action: { primary: actionColor("#7799ff", "#5577dd", "#333333", "#88aaff"), secondary: actionColor("#00000000", "#333333", "#00000000") } },
   markdown: { heading: "#bb88ff" },
   increase: (color: string) => color === "#88aaff" ? "#aaccff" : color,
 }
@@ -68,7 +68,7 @@ test("sidebar renders title, muted URL, fallback and truncation; switching sessi
     assert.match(frame, /http:\/\/localhost:3000\/flows/)
     assert.match(frame, /Untitled/)
     assert.ok(hasVisibilityButton(frame, "Headless"), "the visibility button belongs on the title row")
-    assert.ok(!frame.includes("[ Settings ]"), "the highlighted button should not have text brackets")
+    assert.ok(!frame.includes("[ Settings ]"), "the button should not have text brackets")
     assert.ok(!frame.includes("Visibility:"))
     assert.ok(frame.includes("Shared / Headless"), "the state appears below the title")
     assert.ok(!frame.includes("long-path/".repeat(5)), "long URLs must not wrap onto extra lines")
@@ -586,8 +586,8 @@ test("paused browsers cannot change visibility and a session switch cancels an o
     setSession("paused")
     await ui.waitForFrame((frame) => frame.includes("paused"))
     const disabled = ui.captureSpans().lines.flatMap((line) => line.spans).find((span) => span.text.trim() === "Settings")!
-    assert.ok(disabled.bg.equals(RGBA.fromHex(theme.background.action.primary.disabled)))
-    assert.ok(disabled.fg.equals(RGBA.fromHex(theme.text.action.primary.disabled)))
+    assert.ok(disabled.bg.equals(RGBA.fromHex("#00000000")))
+    assert.ok(disabled.fg.equals(RGBA.fromHex(theme.text.action.secondary.disabled)))
     await click("headed")
     assert.equal(f.confirmations.length, 0)
     assert.equal(f.selections.length, 0)
@@ -641,7 +641,7 @@ test("failed metadata reads retain a disabled Settings button and clear stale me
     assert.match(unavailable, /Browser use/)
     assert.match(unavailable, /Settings/)
     const disabled = ui.captureSpans().lines.flatMap((line) => line.spans).find((span) => span.text.trim() === "Settings")!
-    assert.ok(disabled.bg.equals(RGBA.fromHex(theme.background.action.primary.disabled)))
+    assert.ok(disabled.bg.equals(RGBA.fromHex("#00000000")))
     await click("headed")
     assert.equal(f.selections.length, 0, "settings cannot open with unknown state")
     assert.equal(f.calls.length, 0)
@@ -674,14 +674,14 @@ test("the visibility button highlights on hover without opening the picker", asy
   try {
     const background = () => ui.captureSpans().lines.flatMap((line) => line.spans).find((span) => span.text.trim() === "Settings")!.bg
     const before = background()
-    assert.ok(before.equals(RGBA.fromHex(theme.background.action.primary.focused)), "use the filled highlight even when the normal action background is transparent")
+    assert.ok(before.equals(RGBA.fromHex(theme.background.action.secondary.base)), "the resting button uses the secondary action color")
     const label = ui.captureSpans().lines.flatMap((line) => line.spans).find((span) => span.text.trim() === "Settings")!
-    assert.ok(label.fg.equals(RGBA.fromHex(theme.text.action.primary.focused)), "use its matching foreground for contrast")
+    assert.ok(label.fg.equals(RGBA.fromHex(theme.text.action.secondary.base)), "use the secondary action text color")
     const { x, y } = position()
     await ui.mockMouse.moveTo(x, y)
     await ui.renderOnce()
     assert.notDeepEqual(background(), before)
-    assert.ok(background().equals(RGBA.fromHex(theme.increase(theme.background.action.primary.focused))))
+    assert.ok(background().equals(RGBA.fromHex(theme.background.action.secondary.hovered)))
     assert.equal(f.selections.length, 0)
     await ui.mockMouse.moveTo(0, 0)
     await ui.renderOnce()
