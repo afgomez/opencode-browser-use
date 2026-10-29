@@ -346,6 +346,79 @@ test("idle shutdown resets the default to headless", async () => {
   await f.manager.dispose()
 })
 
+for (const cleanup of ["release", "lease expiry"] as const) {
+  test(`idle cleanup resets a failed restart without Chrome after ${cleanup}`, async () => {
+    const f = fixture()
+    const detach = f.manager.attach()
+    try {
+      await f.manager.execute("switch_mode", { mode: "headed" }, caller("a"))
+      await f.open("a")
+      f.failLaunch()
+      await assert.rejects(f.manager.execute("switch_mode", { mode: "headless" }, caller("a")), /launch failed/)
+      if (cleanup === "release") await f.manager.release("a")
+      else { f.advance(1001); await f.manager.sweep() }
+
+      f.advance(99)
+      await f.manager.sweep()
+      const waiting = parse(await f.manager.execute("status", {}, caller("a")))
+      assert.equal(waiting.running, false)
+      assert.equal(waiting.activeLeases, 0)
+      assert.equal(waiting.paused, true)
+
+      f.advance(2)
+      await f.manager.sweep()
+      const cleaned = parse(await f.manager.execute("status", {}, caller("a")))
+      assert.equal(cleaned.running, false)
+      assert.equal(cleaned.paused, false)
+      assert.equal(cleaned.mode, "headless")
+      assert.deepEqual(cleaned.pages, [])
+      await f.open("b")
+      assert.deepEqual(f.modes, [false, true])
+      assert.deepEqual(parse(await f.manager.execute("list_pages", {}, caller("a"))).pages, [])
+    } finally { detach(); await f.manager.dispose() }
+  })
+}
+
+test("idle cleanup does not discard failed restoration while another session holds a lease", async () => {
+  const f = fixture()
+  try {
+    await f.open("a")
+    const b = await f.open("b")
+    f.failLaunch()
+    await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /launch failed/)
+    await f.manager.release("a")
+    f.advance(101)
+    await f.manager.sweep()
+    const status = parse(await f.manager.execute("status", {}, caller("b")))
+    assert.equal(status.paused, true)
+    assert.equal(status.leaseHeld, true)
+    await f.manager.execute("switch_mode", { mode: "headless" }, caller("b"))
+    const pages = parse(await f.manager.execute("list_pages", {}, caller("b"))).pages
+    assert.equal(pages[0].pageId, b)
+    assert.equal(pages[0].url, "https://b.test/")
+  } finally { await f.manager.dispose() }
+})
+
+test("unload cleanup retires a failed restart after releasing its leases and waiting for idle", async () => {
+  const f = fixture()
+  const detach = f.manager.attach()
+  try {
+    await f.open("a")
+    f.failLaunch()
+    await assert.rejects(f.manager.execute("switch_mode", { mode: "headed" }, caller("a")), /launch failed/)
+    detach()
+    f.advance(201)
+    await f.manager.sweep()
+    f.advance(101)
+    await f.manager.sweep()
+    const status = parse(await f.manager.execute("status", {}, caller("a")))
+    assert.equal(status.running, false)
+    assert.equal(status.activeLeases, 0)
+    assert.equal(status.paused, false)
+    assert.throws(() => f.manager.attach(), /unloaded/)
+  } finally { detach(); await f.manager.dispose() }
+})
+
 test("additive hot reload upgrades a live manager without discarding leases or tabs", async () => {
   const f = fixture()
   const a = await f.open("a")

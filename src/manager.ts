@@ -303,7 +303,8 @@ export class BrowserManager {
       for (const [sessionID, lease] of this.leases) {
         if (unloaded || now - lease.touched >= this.config.leaseTimeoutMs) await this.releaseSession(sessionID)
       }
-      if (!this.leases.size && this.browser) {
+      // A failed launch can leave recovery state even though no browser exists.
+      if (!this.leases.size && (this.browser || this.restoration)) {
         this.idleAt ??= now
         if (now - this.idleAt >= this.config.idleTimeoutMs) await this.stop()
       }
