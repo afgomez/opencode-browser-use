@@ -14,7 +14,7 @@ import { createSettings, SettingsCommands, type Settings } from "../src/browser-
 import { SettingsDialog } from "../src/settings"
 
 const hasSpinner = (frame: string) => spinnerFrames.some((glyph) => frame.includes(glyph))
-const hasSettingsButton = (frame: string, visibility: "Headless" | "Headed") => frame.split("\n").some((line) => line.includes("Browser use") && line.includes("Settings")) && frame.includes(`Shared / ${visibility}`)
+const hasSettingsButton = (frame: string, visibility: "Headless" | "Headed") => frame.split("\n").some((line) => line.includes(`Shared / ${visibility}`) && line.includes("Settings"))
 const actionColor = (base: string, hovered: string, disabled: string, focused = base) => ({
   base, hovered, disabled, focused,
   state: (states: { disabled?: boolean; hovered?: boolean; focused?: boolean }) => states.disabled ? disabled : states.focused ? focused : states.hovered ? hovered : base,
@@ -67,7 +67,7 @@ test("sidebar renders title, muted URL, fallback and truncation; switching sessi
     assert.match(frame, /Browser use · 2 tabs/)
     assert.match(frame, /http:\/\/localhost:3000\/flows/)
     assert.match(frame, /Untitled/)
-    assert.ok(hasSettingsButton(frame, "Headless"), "the settings button belongs on the title row")
+    assert.ok(hasSettingsButton(frame, "Headless"), "the settings button belongs on the mode row")
     assert.ok(!frame.includes("[ Settings ]"), "the button should not have text brackets")
     assert.ok(!frame.includes("Visibility:"))
     assert.ok(frame.includes("Shared / Headless"), "the state appears below the title")
@@ -136,7 +136,7 @@ test("sidebar shows mode and applicable visibility beneath the title", async () 
     assert.ok(isolated.split("\n").findIndex((line) => line.includes("Isolated / Headed")) > isolated.split("\n").findIndex((line) => line.includes("Browser use")))
     current = { ...current, mode: "attach", visibility: null }
     setSession("b")
-    const user = await ui.waitForFrame((frame) => frame.split("\n").some((line) => line.trim() === "Attach"))
+    const user = await ui.waitForFrame((frame) => frame.split("\n").some((line) => line.includes("Attach") && line.includes("Settings")))
     assert.ok(!user.includes(" / Head"))
   } finally { await ui.dispose() }
 })
@@ -686,13 +686,12 @@ test("failed metadata reads retain a disabled Settings button and clear stale me
   } finally { await ui.dispose() }
 })
 
-test("the settings button stays on the title row in a narrow sidebar and its padding is clickable", async () => {
+test("the settings button stays on the mode row in a narrow sidebar and its padding is clickable", async () => {
   const { f, ui, position } = await settingsFixture()
   try {
     ui.resize(26, 12)
-    const frame = await ui.waitForFrame((frame) => frame.includes("Headless"))
-    assert.equal(frame.split("\n").filter((line) => line.includes("Headless")).length, 1)
-    assert.equal(frame.split("\n").findIndex((line) => line.includes("Settings")), frame.split("\n").findIndex((line) => line.trim().length > 0), "the button must not wrap below the title")
+    const frame = await ui.waitForFrame((frame) => frame.split("\n").some((line) => line.includes("Shared") && line.includes("Settings")))
+    assert.equal(frame.split("\n").findIndex((line) => line.includes("Settings")), frame.split("\n").findIndex((line) => line.includes("Shared")), "the button must remain on the mode row")
     const { x, y } = position()
     await ui.mockMouse.click(x - 2, y)
     await ui.waitFor(() => f.dialogs === 1)

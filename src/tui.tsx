@@ -41,11 +41,17 @@ export function BrowserSidebar(props: { sessionID: string; settings?: Settings }
     if (updated && !current.signal.aborted) setSnapshot(updated)
   }
   return (
-    <box flexDirection="column" gap={1} paddingTop={1} flexShrink={0}>
+    <box flexDirection="column" gap={1} flexShrink={0}>
       <box flexDirection="column">
+        <text fg={context.theme.text.base} height={1} wrapMode="none" truncate>
+          <strong>Browser use<Show when={!unavailable()}> · {snapshot().pages.length} {snapshot().pages.length === 1 ? "tab" : "tabs"}</Show></strong>
+        </text>
         <box flexDirection="row" gap={1} justifyContent="space-between">
-          <text fg={context.theme.text.base} width={0} flexGrow={1} flexShrink={1} minWidth={0} height={1} wrapMode="none" truncate>
-            <strong>Browser use<Show when={!unavailable()}> · {snapshot().pages.length} {snapshot().pages.length === 1 ? "tab" : "tabs"}</Show></strong>
+          <text fg={context.theme.text.muted} width={0} flexGrow={1} flexShrink={1} minWidth={0} height={1} wrapMode="none" truncate>
+            <Show when={!unavailable()} fallback={<>Browser connection unavailable; retrying…</>}>
+              {snapshot().mode === "attach" ? "Attach" : snapshot().mode === "isolated" ? "Isolated" : "Shared"}
+              <Show when={snapshot().mode !== "attach" && snapshot().visibility}> / {snapshot().visibility === "headless" ? "Headless" : "Headed"}</Show>
+            </Show>
           </text>
           <box flexDirection="row" flexShrink={0}>
             <Show when={switching()} fallback={<>
@@ -67,15 +73,6 @@ export function BrowserSidebar(props: { sessionID: string; settings?: Settings }
             </Show>
           </box>
         </box>
-        <Show when={!unavailable()}>
-          <text fg={context.theme.text.muted} height={1} wrapMode="none" truncate>
-            {snapshot().mode === "attach" ? "Attach" : snapshot().mode === "isolated" ? "Isolated" : "Shared"}
-            <Show when={snapshot().mode !== "attach" && snapshot().visibility}> / {snapshot().visibility === "headless" ? "Headless" : "Headed"}</Show>
-          </text>
-        </Show>
-        <Show when={unavailable()}>
-          <text fg={context.theme.text.muted}>Browser connection unavailable; retrying…</text>
-        </Show>
       </box>
       <For each={snapshot().pages}>{(page) => (
         <box flexDirection="column" flexShrink={0} paddingLeft={2}>
