@@ -15,9 +15,9 @@
     "README.md"
   ],
   "scripts": {
-    "test": "tsx --test test/*.test.ts",
-    "test:integration": "tsx --test test/integration.ts",
-    "test:opencode": "tsx --test test/opencode.ts",
+    "test": "bun test ./test/*.test.ts",
+    "test:integration": "bun test ./test/integration.ts",
+    "test:opencode": "bun test ./test/opencode.ts",
     "test:tui": "bun test --preload @opentui/solid/preload test/tui.test.tsx",
     "typecheck": "tsc --noEmit"
   },
@@ -45,7 +45,6 @@
     "@types/node": "26.0.0",
     "@types/proper-lockfile": "4.1.4",
     "solid-js": "1.9.12",
-    "tsx": "4.21.0",
     "typescript": "5.9.3"
   }
 }

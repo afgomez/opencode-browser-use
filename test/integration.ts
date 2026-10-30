@@ -205,7 +205,7 @@ test("a crashed manager's Chrome is verified and reclaimed after the profile loc
     console.log('READY');
     setInterval(() => {}, 1000);
   `
-  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] })
+  const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] })
   const chrome = new Chrome(options({ profileDirectory }))
   try {
     await new Promise<void>((resolve, reject) => {

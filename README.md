@@ -7,11 +7,11 @@ global MCP installation, extension, or browser download.
 
 ## Setup
 
-Requires Node 20.19+, 22.12+, or 23+ and regular Google Chrome. Dependencies
-are already installed here. To reinstall reproducibly:
+Requires Bun (tested with 1.4.0), Node 20.19+, 22.12+, or 23+, and regular
+Google Chrome. Dependencies are already installed here. To reinstall reproducibly:
 
 ```sh
-npm ci --ignore-scripts
+bun install --frozen-lockfile
 ```
 
 This package lives at `~/code/opencode-browser-use` and is explicitly registered
@@ -342,11 +342,11 @@ tool or independent configured MCP connection.
 ## Development
 
 ```sh
-npm run typecheck
-npm test
-npm run test:integration
-npm run test:opencode
-npm run test:tui
+bun run typecheck
+bun run test
+bun run test:integration
+bun run test:opencode
+bun run test:tui
 ```
 
 Integration tests use disposable profiles, a local HTTP server, and regular
